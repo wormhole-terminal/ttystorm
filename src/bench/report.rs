@@ -22,6 +22,16 @@ fn reference(name: &str, unit: Unit) -> f64 {
         (_, "scrollstorm") => 400.0,
         (_, "cursorstorm") => 300.0,
         (_, "longlines") => 600.0,
+        // Mostly text with a few colors: close to plain log lines.
+        (_, "buildlog") => 300.0,
+        // Tiny writes: the cost is per write, so even a fast terminal takes in only a few MB/s.
+        (_, "agentstream") => 8.0,
+        (_, "diffscroll") => 250.0,
+        (_, "editstorm") => 150.0,
+        (_, "stylestorm") => 200.0,
+        (_, "linkstorm") => 250.0,
+        // A full-screen paint per swap, about 20 KB at 120×40.
+        (Unit::PerSec, _) => 1000.0,
         _ => 1000.0,
     }
 }
@@ -54,10 +64,13 @@ pub fn push_value(l: &mut Line, t: &TestResult, width: usize) {
     l.pad(width.saturating_sub(used)).bold(&num, TEXT).text(&format!(" {unit}"), DIM);
 }
 
-fn section(unit: Unit) -> &'static str {
-    match unit {
+/// The section a result sits under: real-world output apart from the stress tests that share its unit.
+fn section(t: &TestResult) -> &'static str {
+    match t.unit {
+        Unit::MBps if super::workloads::REALISTIC.contains(&t.name.as_str()) => "REAL-WORLD OUTPUT",
         Unit::MBps => "THROUGHPUT",
         Unit::Fps => "FULL-SCREEN REDRAWS",
+        Unit::PerSec => "SCREEN SWAPS",
         Unit::Micros => "ROUND-TRIP LATENCY",
     }
 }
@@ -158,19 +171,19 @@ pub fn results_panel(r: &Results, width: usize, saved: Option<&str>) -> Panel {
     p.rule(2);
 
     let lay = layout(width);
-    let mut last: Option<Unit> = None;
+    let mut last: Option<&str> = None;
     for t in &r.tests {
-        if last != Some(t.unit) {
+        if last != Some(section(t)) {
             p.blank();
             let mut l = Line::new();
-            l.pad(2).bold(section(t.unit), FAINT);
+            l.pad(2).bold(section(t), FAINT);
             if lay.spread && last.is_none() {
                 // Column titles above the first section only.
                 let end = 2 + NAME_W + 1 + lay.bar + 2 + VALUE_W;
                 l.right("median", DIM, end).right("spread", DIM, end + 2 + SPREAD_W);
             }
             p.push(l);
-            last = Some(t.unit);
+            last = Some(section(t));
         }
         p.push(row(t, &lay));
     }
