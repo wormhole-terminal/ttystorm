@@ -1,5 +1,5 @@
-//! The result screen printed after a run: a header with the terminal and machine, then one gradient
-//! bar per test. It is built to be screenshotted, so it paints its own dark panel and looks the
+//! The result screen printed after a run: a header with the terminal and machine, then one bar per
+//! test. It is built to be screenshotted, so it paints its own dark panel and looks the
 //! same in any theme.
 
 use super::results::{Results, TestResult, Unit};
@@ -135,7 +135,7 @@ pub fn results_panel(r: &Results, width: usize, saved: Option<&str>) -> Panel {
     let inner = width.saturating_sub(4);
     p.blank();
     let mut l = Line::new();
-    l.pad(2).gradient_text("ttystorm").text("  terminal throughput & latency", DIM);
+    l.pad(2).title("ttystorm").text("  terminal throughput & latency", DIM);
     if width >= 70 {
         l.right(&r.date, DIM, width - 2);
     }

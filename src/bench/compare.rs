@@ -139,7 +139,7 @@ pub fn compare_panel(all: &[Results], width: usize) -> Panel {
     let base = &all[0];
     p.blank();
     let mut l = Line::new();
-    l.pad(2).gradient_text("ttystorm compare");
+    l.pad(2).title("ttystorm compare");
     l.text(&format!("  {} terminals", all.len()), DIM);
     if width >= 70 {
         l.right(&base.date, DIM, width - 2);
