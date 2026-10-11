@@ -6,14 +6,14 @@ mod compose;
 mod details;
 mod diag;
 mod flood;
-mod json;
+pub(crate) mod json;
 mod procinfo;
 mod report;
 mod results;
 mod runner;
 mod stats;
-mod sysinfo;
-mod ui;
+pub(crate) mod sysinfo;
+pub(crate) mod ui;
 mod workloads;
 
 use std::io::{self, Write};

@@ -197,6 +197,148 @@ baseline).
 What it doesn't measure: keypress-to-pixel latency (that needs a camera or a tool like
 `typometer`), and frames actually drawn on screen.
 
+## Feature check
+
+`ttyprobe` asks the terminal what it supports and measures how it draws text, so terminals can be
+compared on more than speed. Like every command here it is also `ttystorm ttyprobe`.
+
+```sh
+ttyprobe                                 # the result screen, then a sample page to look at
+ttyprobe --details                       # + every query sent and received, and what it means
+ttyprobe --save wormhole.json --label Wormhole
+ttystorm compare wormhole.json ghostty.json kitty.json           # one matrix, differences marked
+ttystorm compare --markdown wormhole.json ghostty.json > terminals.md
+```
+
+Options: `--plain` (the results as plain text, no colors, no sample page; the queries are still
+sent), `--save <file.json>`, `--label <name>` (default `$TERM_PROGRAM`), `--details`, `--raw [file]`
+and `--no-sample`.
+
+### What it asks
+
+Each row of the result screen is one question, and the terminal's own answer:
+
+- **Identity**: XTVERSION (the terminal's name and version), the DA1 and DA2 device attributes, and
+  `$TERM_PROGRAM`, `$TERM`, `$COLORTERM`, and whether a multiplexer (tmux, screen, zellij) is in the way.
+- **Modes**, by DECRQM: synchronized output (2026), grapheme clustering (2027), bracketed paste, focus
+  events, SGR mouse and SGR-pixels mouse, the alternate screen, color-scheme updates (2031), autowrap,
+  cursor visibility and blink. Also the Kitty keyboard protocol's flags and the cursor style.
+- **Graphics**: the Kitty graphics protocol (a one-pixel test image, `a=q`), Sixel (DA1 attribute 4) and
+  iTerm2's inline images (its cell size report).
+- **Colors**: foreground, background and palette color 1 as the terminal reports them (OSC 10, 11, 4),
+  whether the background is dark, and truecolor: it sets a known 24-bit color and asks the terminal
+  to report its graphic rendition (DECRQSS) to see if the color is still in it.
+- **Sizes**: in cells, in window pixels and in cell pixels (`CSI 18/14/16 t`), and what the tty says.
+
+A feature that the terminal answers (a ✓ or ✗) is known; `?` means it answered nothing and nothing is known.
+
+### The DA1 trick
+
+Every query is followed by DA1 (`CSI c`, "what are you"). A terminal answers its queries in
+order, and practically every terminal answers DA1. So when the DA1 reply arrives *without* the
+query's own reply, the answer is "not supported", known in microseconds, with no timeout to wait
+out. Only a terminal that answers nothing at all costs time: the first query waits 1 s, and when
+that gets no DA1 reply either, the rest is not asked and everything reads `?`.
+
+### Why widths matter
+
+How many cells a character takes is not settled. Unicode says an emoji with a skin tone or a family
+joined by zero-width joiners is one character and two cells wide. A terminal that counts code points
+draws the family as six cells, and the program running in it, which counted by the rules, puts the
+cursor and the borders in the wrong place. The only way to learn what a terminal does is to ask where
+the cursor is: `ttyprobe` goes to column 1, writes the text, asks for the cursor position (DSR 6) and
+takes the distance. Twenty cases (ASCII, combining marks, CJK, Hangul jamo, emoji with VS16, skin tones,
+ZWJ sequences, flags, keycaps, arrows, box drawing, a lone ZWJ) are compared with the width Unicode
+15.1/16 gives their grapheme cluster. The Devanagari conjunct is disputed (fonts, Unicode and
+terminals disagree), so it is shown but not scored. If the terminal has mode 2027 (grapheme
+clustering) the cases are measured twice, as the terminal is and with the mode set, because that is the
+difference programs have to know about; the mode is put back after.
+
+The score reads "17 of 19 match".
+
+### What it can't know
+
+Some things cannot be asked, so they are not rows; the sample page printed after the results shows them
+for eyes and screenshots: underline styles (`4:1` to `4:5`) and colored underlines, italic, bold, dim,
+strikethrough, overline, blink, reverse, an OSC 8 hyperlink, box drawing, block elements and braille on
+a ruler, powerline glyphs, and a grid of emoji and CJK where a misdrawn width shifts the bars. Clipboard
+access (OSC 52) is also not asked: reading the clipboard is a privacy question and writing it changes
+the user's clipboard. A ✗ on a mode means the terminal did not announce it, not that it never works:
+a terminal can support a mode and still not answer DECRQM for it. Inside tmux or screen the answers
+come from the multiplexer, not the terminal. Replies come from the terminal's parser, not its
+renderer: a terminal can report a width and still draw something else with its font.
+
+### Debugging and handing it to an agent
+
+Every exchange is recorded: what was sent, the raw reply (escaped, `\x1b` is ESC), how long it took and
+how the result was decided. `--details` prints them after the results, one line per query:
+
+```
+synchronized output (2026) | sent \x1b[?2026$p\x1b[c | received \x1b[?2026;2$y\x1b[?64;1;4c | 37 µs | reply
+focus events (1004) | sent \x1b[?1004$p\x1b[c | received \x1b[?64;1;4c | 32 µs | sentinel
+```
+
+The width cases add the cursor reports before and after the text, so a width can be traced to the
+bytes it came from. Anything unexpected is a line below with a `!`: replies that came out of order or
+that nobody asked for, replies that don't have the expected shape, bytes already waiting when the
+query went out. After the transcript comes **FINDINGS**, in plain words: "synchronized output (2026)
+not reported: the terminal may still support it without answering DECRQM", "ZWJ sequences drawn 6
+wide: grapheme clustering is off; enable mode 2027", "no reply at all within 1 s: probably not a real
+terminal, or behind a multiplexer that swallows queries, try outside tmux".
+
+How a result was decided (`decided`):
+
+| Value | Meaning |
+|---|---|
+| `reply` | the terminal's reply arrived and was read |
+| `sentinel` | DA1 came back first, without an answer: not supported |
+| `timeout` | neither the answer nor DA1 came in time |
+| `unparsed` | something came back, but not in the shape the query expects |
+| `skipped` | not asked: an earlier query had already got no DA1 reply |
+| `environment` | read from the environment (`$TERM`, the tty size) |
+| `derived` | worked out from another row (Sixel from DA1, dark background from OSC 11) |
+
+`--raw` also dumps every byte read from the terminal while probing, one chunk per line with the
+time it arrived, to stderr, or to a file with `--raw probe-raw.txt`. It is for debugging `ttyprobe`
+itself (a reply that was split, or that no query accounts for).
+
+**Give the `--save` JSON to your coding agent** to find out why something reads as unsupported: it has
+the transcripts and the findings, and they were written to be read without running anything again.
+
+The file (`"format": "ttystorm-probe"`):
+
+| Field | Meaning |
+|---|---|
+| `format`, `format_version`, `tool_version` | `ttystorm-probe`, the file layout's version, `ttystorm`'s version |
+| `label`, `terminal`, `cols`, `rows`, `date` | the name given with `--label`, `$TERM_PROGRAM` and its version, the size in cells, the day |
+| `machine` | `cpu`, `model`, `os`, `memory`, `cores`, as in benchmark files |
+| `score_as_is`, `score_2027` | `{"matched": 17, "counted": 19}` over the cases that are not disputed; `null` when not measured |
+| `findings` | the findings, plain sentences |
+| `events` | unexpected things that belong to no row (a first query with no DA1 reply, giving up) |
+| `features[]` | one per row, see below |
+| `widths[]` | one per width case, see below |
+
+A `features[]` entry: `section` (Identity, Modes, Graphics, Colors, Sizes), `name`, `status` (`yes`, `no`,
+`value`, `unknown`), `value` (for `value` rows: `"#1e1e2e"`, `"WezTerm 2024"`), `note` (a detail beside
+the mark: a mode's state `on`/`off`, `flags 31`, `not reported`), `how` (the short form of the query)
+and its transcript: `decided`, `sent`, `received`, `micros` (from the request to the reply that decided it),
+`notes` (the unexpected).
+
+A `widths[]` entry: `name`, `codepoints` (`1F468 200D 1F469`), `expected` (cells), `disputed`, `measured` and
+`measured_2027` (cells, or `null`), and `as_is` and `with_2027` (`null` when the terminal has no mode 2027),
+each `{"width", "dsr_before", "dsr_after", "decided", "sent", "received", "micros", "notes"}`.
+`dsr_before` and `dsr_after` are the raw cursor reports, such as `\x1b[2;1R` and `\x1b[2;3R`; the width is
+the difference of their columns.
+
+### Comparing terminals
+
+Run `ttyprobe --save <terminal>.json` in each terminal (outside tmux; the same window size is not
+needed), then `ttystorm compare a.json b.json …`. For probe files the result is a matrix: a column per
+terminal, a row per feature and per width case, ✓ ✗ ? or the value, widths green when they match
+Unicode and red when they don't, and `≠` marking the rows where the terminals differ. Identity and size
+rows are expected to differ and are never marked. `--markdown` prints the same as tables for an issue or
+a README. Benchmark files and probe files can't be mixed in one `compare`; it names which is which.
+
 ## Recording for social media
 
 - **Same conditions for every terminal**: the same window size (the overlay, `h`, shows cols×rows), font
