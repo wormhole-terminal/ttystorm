@@ -319,8 +319,11 @@ pub fn findings(d: &RunDiag, comp: &Composition, process: Option<&Terminal>) -> 
         ));
     } else if blocked >= 0.6 {
         out.push(format!(
-            "read-bound: {}% of the time the write was blocked; the terminal reads slowly - look at its PTY reader/parser",
-            pct(blocked)
+            "read-bound: the writer waited for the terminal {}% of the time and the answer came {:.1} ms after the \
+             last byte, so reading sets the pace and the parser keeps up; to go faster, look at the PTY reader \
+             (read size, wake-ups, copies) and the parser's cost per byte",
+            pct(blocked),
+            d.dsr_wait_s * 1e3
         ));
     }
     if tail >= 0.5 {
@@ -492,7 +495,7 @@ mod tests {
     #[test]
     fn a_blocked_writer_is_read_bound() {
         let f = findings(&run(1.0, 0.82, 0.02), &comp(16_000_000, 250), None);
-        assert!(f[0].starts_with("read-bound: 82% of the time the write was blocked"), "{f:?}");
+        assert!(f[0].starts_with("read-bound: the writer waited for the terminal 82% of the time"), "{f:?}");
         assert_eq!(f.len(), 1);
     }
 

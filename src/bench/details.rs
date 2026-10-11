@@ -215,7 +215,7 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("timeline: ▃▅█") && text.contains("memory +2 MB"), "{text}");
-        assert!(text.contains("read-bound: 85% of the time the write was blocked"), "{text}");
+        assert!(text.contains("read-bound: the writer waited for the terminal 85% of the time"), "{text}");
         // Tests without diagnostics are left out.
         assert!(!text.contains("roundtrip"), "{text}");
     }
