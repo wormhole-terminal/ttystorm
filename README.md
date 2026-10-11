@@ -50,15 +50,16 @@ Checks before a change here is done: `cargo fmt`, `cargo clippy --all-targets --
 | `dashboard` | a busy btop-style monitor with an agent log | a realistic TUI: boxes, sparklines, gradients |
 
 Options: `--fps <n>` (default 60; `0` draws as fast as the terminal reads, the real stress test),
-`--seconds <n>`, `--no-hud`, `--no-sync` (no synchronized output, mode 2026: shows tearing),
+`--seconds <n>`, `--hud`, `--no-sync` (no synchronized output, mode 2026: shows tearing),
 `--titles`. Keys: `q`/Esc quit, space pauses, `h` the overlay, `+ - 0` speed, `← →` previous/next.
 
-The overlay in the top right shows the frames and bytes per second the terminal took in ("fps
-sent"). It is **not** the frame rate on screen: a terminal reads its output on a thread of its own
-and draws when it can, skipping frames it has already replaced, and no program can see from outside
-how many it drew. 60 fps sent with a stuttering picture means the terminal reads fast but draws
-slowly; that is a finding about the terminal, and the stutter is the thing to record. The number
-only drops when even the reading falls behind (the program then blocks writing).
+An animation starts with nothing but the picture. `h` (or `--hud`) shows the overlay in the top
+right: the frames and bytes per second the terminal took in ("fps sent"). It is **not** the frame
+rate on screen: a terminal reads its output on a thread of its own and draws when it can, skipping
+frames it has already replaced, and no program can see from outside how many it drew. 60 fps sent
+with a stuttering picture means the terminal reads fast but draws slowly; that is a finding about
+the terminal, and the stutter is the thing to record. The number only drops when even the reading
+falls behind (the program then blocks writing).
 
 ## Benchmarks
 
@@ -100,14 +101,14 @@ What it doesn't measure: keypress-to-pixel latency (that needs a camera or a too
 
 ## Recording for social media
 
-- **Same conditions for every terminal**: the same window size (the overlay shows cols×rows), font
+- **Same conditions for every terminal**: the same window size (the overlay, `h`, shows cols×rows), font
   size and machine, with nothing else busy. Quit other heavy apps; plug the laptop in.
-- **Clean frame**: hide Wormhole's sidebar and panel, a dark theme, `--no-hud` unless the numbers are
+- **Clean frame**: hide Wormhole's sidebar and panel, a dark theme; `--hud` only when the numbers are
   the point. macOS screen recording: ⇧⌘5, or `ffmpeg -f avfoundation` at 60 fps.
-- **Loops**: `warptunnel --seconds 12 --no-hud` gives a clip with a clean start and end; the
+- **Loops**: `warptunnel --seconds 12` gives a clip with a clean start and end; the
   fire's word comes 2.5 s into every 12 s cycle.
 - **Tearing vs not**: record `plasma --fps 0 --no-sync` next to `plasma --fps 0`.
-- **Stress**: `--fps 0` with the overlay on shows how many frames and MB/s the terminal takes in;
+- **Stress**: `--fps 0 --hud` shows how many frames and MB/s the terminal takes in;
   side by side with another terminal, it is the most direct comparison.
 - **Numbers**: `ttystorm bench --save <name>.json` in each terminal, then
   `ttystorm compare a.json b.json …` for one screen with them all, best marked, ratios to the first

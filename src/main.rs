@@ -34,12 +34,12 @@ const ANIMATION_OPTIONS: &str = "\
 ANIMATION OPTIONS
   --fps <n>       frames per second to aim for (default 60; 0 = as fast as the terminal reads)
   --seconds <n>   stop after n seconds (per animation in a showcase; default 10 there)
-  --no-hud        hide the fps / MB/s line (toggle with h)
+  --hud           start with the fps / MB/s overlay on (h shows and hides it)
   --no-sync       don't use synchronized output (mode 2026): shows tearing
   --titles        show each animation's name as it starts (on in a showcase)
 
 KEYS
-  q / Esc         quit           space   pause        h   overlay
+  q / Esc         quit           space   pause        h   fps / MB/s overlay
   ← →             previous/next  + - 0   speed
 ";
 
@@ -168,6 +168,8 @@ fn demo_options(args: &[String]) -> io::Result<Options> {
         match args[i].as_str() {
             "--fps" => o.fps = number(value(args, &mut i)?)?,
             "--seconds" => o.seconds = Some(number(value(args, &mut i)?)?),
+            "--hud" => o.hud = true,
+            // The default since 1.1; still taken so older scripts keep working.
             "--no-hud" => o.hud = false,
             "--no-sync" => o.sync = false,
             "--titles" => o.titles = true,
