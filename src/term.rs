@@ -633,28 +633,51 @@ mod tests {
         assert_eq!(parse_keys(b"\x1b[?64;4cq\x1b"), vec![Key::Char('q'), Key::Esc]);
     }
 
-    fn input_with(chunks: Vec<(u64, &'static [u8])>) -> Input {
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            for (ms, c) in chunks {
-                thread::sleep(Duration::from_millis(ms));
-                if tx.send(c.to_vec()).is_err() {
-                    break;
-                }
+    /// A stand-in for the terminal that answers when the request is flushed, not after a fixed sleep,
+    /// so the tests don't depend on how busy the machine is. `unasked` is waiting before any request.
+    struct Fake {
+        tx: mpsc::Sender<Vec<u8>>,
+        replies: Option<Vec<(u64, &'static [u8])>>,
+        sent: Vec<u8>,
+    }
+
+    impl Write for Fake {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.sent.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            if let Some(replies) = self.replies.take() {
+                let tx = self.tx.clone();
+                thread::spawn(move || {
+                    for (ms, c) in replies {
+                        thread::sleep(Duration::from_millis(ms));
+                        if tx.send(c.to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                });
             }
-            // Keep the channel open so a missing reply times out instead of disconnecting.
-            thread::sleep(Duration::from_millis(500));
-        });
-        Input::with_receiver(rx)
+            Ok(())
+        }
+    }
+
+    /// The channel stays open while the `Fake` lives, so a missing reply times out.
+    fn fake(unasked: &[&'static [u8]], replies: Vec<(u64, &'static [u8])>) -> (Input, Fake) {
+        let (tx, rx) = mpsc::channel();
+        for c in unasked {
+            let _ = tx.send(c.to_vec());
+        }
+        (Input::with_receiver(rx), Fake { tx, replies: Some(replies), sent: Vec::new() })
     }
 
     #[test]
     fn ask_collects_replies_up_to_the_da1_reply() {
-        let mut input =
-            input_with(vec![(0, b"\x1b[?2026;2$y\x1bP>|Te"), (20, b"rm\x1b\\\x1b[?64;4c\x1b[?2027;1$y")]);
-        let mut out = Vec::new();
-        let a = input.ask(&mut out, b"\x1b[?2026$p", Duration::from_secs(2)).expect("ask");
-        assert_eq!(out, b"\x1b[?2026$p\x1b[c");
+        let (mut input, mut term) =
+            fake(&[], vec![(0, b"\x1b[?2026;2$y\x1bP>|Te"), (20, b"rm\x1b\\\x1b[?64;4c\x1b[?2027;1$y")]);
+        let a = input.ask(&mut term, b"\x1b[?2026$p", Duration::from_secs(2)).expect("ask");
+        assert_eq!(term.sent, b"\x1b[?2026$p\x1b[c");
         assert_eq!(a.replies.len(), 2);
         assert_eq!(a.replies[0].0, csi("?2026;2$y"));
         assert_eq!(a.replies[1].0.body, ">|Term");
@@ -666,8 +689,8 @@ mod tests {
 
     #[test]
     fn ask_times_out_without_da1_and_keeps_what_came() {
-        let mut input = input_with(vec![(0, b"junk")]);
-        let a = input.ask(&mut Vec::new(), b"", Duration::from_millis(100)).expect("ask");
+        let (mut input, mut term) = fake(&[], vec![(0, b"junk")]);
+        let a = input.ask(&mut term, b"", Duration::from_millis(100)).expect("ask");
         assert_eq!(a.da1, None);
         assert_eq!(a.raw, b"junk");
         assert!(a.replies.is_empty() && a.waited >= 100_000);
@@ -675,30 +698,29 @@ mod tests {
 
     #[test]
     fn ask_reports_what_was_waiting_before_it() {
-        let mut input = input_with(vec![(0, b"\x1b[0n"), (60, b"\x1b[?1;2c")]);
-        thread::sleep(Duration::from_millis(30));
-        let a = input.ask(&mut Vec::new(), b"", Duration::from_secs(2)).expect("ask");
+        let (mut input, mut term) = fake(&[b"\x1b[0n"], vec![(0, b"\x1b[?1;2c")]);
+        let a = input.ask(&mut term, b"", Duration::from_secs(2)).expect("ask");
         assert_eq!(a.stale, b"\x1b[0n");
         assert!(a.da1.is_some());
     }
 
     #[test]
     fn cursor_reports_come_in_order_and_keep_their_bytes() {
-        let mut input = input_with(vec![(0, b"x\x1b[2;1"), (10, b"R\x1b[2;3R")]);
-        let got = input.cursor_reports(&mut Vec::new(), b"", 2, Duration::from_secs(2)).expect("reports");
+        let (mut input, mut term) = fake(&[], vec![(0, b"x\x1b[2;1"), (10, b"R\x1b[2;3R")]);
+        let got = input.cursor_reports(&mut term, b"", 2, Duration::from_secs(2)).expect("reports");
         let cells: Vec<(u16, u16)> = got.reports.iter().map(|c| (c.row, c.col)).collect();
         assert_eq!(cells, vec![(2, 1), (2, 3)]);
         assert_eq!(got.reports[1].raw, b"\x1b[2;3R");
-        let mut short = input_with(vec![(0, b"\x1b[2;1R")]);
-        let got = short.cursor_reports(&mut Vec::new(), b"", 2, Duration::from_millis(100)).expect("reports");
+        let (mut short, mut term) = fake(&[], vec![(0, b"\x1b[2;1R")]);
+        let got = short.cursor_reports(&mut term, b"", 2, Duration::from_millis(100)).expect("reports");
         assert_eq!(got.reports.len(), 1);
     }
 
     #[test]
     fn the_raw_log_keeps_every_chunk() {
-        let mut input = input_with(vec![(0, b"\x1b[?1;2c")]);
+        let (mut input, mut term) = fake(&[], vec![(0, b"\x1b[?1;2c")]);
         input.record_raw();
-        let _ = input.ask(&mut Vec::new(), b"", Duration::from_secs(2));
+        let _ = input.ask(&mut term, b"", Duration::from_secs(2));
         assert_eq!(input.raw_log().len(), 1);
         assert!(input.raw_log()[0].ends_with("\\x1b[?1;2c"), "{:?}", input.raw_log());
     }
