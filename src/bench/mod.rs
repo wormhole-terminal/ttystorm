@@ -66,6 +66,13 @@ fn selected(only: &[String]) -> Result<Vec<&'static str>, String> {
     Ok(workloads::NAMES.iter().copied().filter(|n| only.is_empty() || wanted.contains(n)).collect())
 }
 
+/// Standard output without std's line buffering: each write of a workload reaches the pty as one
+/// write, as the workload meant it (a token-sized write with a newline in it would otherwise be two).
+pub(crate) fn unbuffered_stdout() -> io::Result<std::fs::File> {
+    use std::os::fd::AsFd;
+    Ok(std::fs::File::from(io::stdout().as_fd().try_clone_to_owned()?))
+}
+
 pub fn run(opts: &BenchOptions) -> io::Result<()> {
     if !(0.05..=4096.0).contains(&opts.size_mb) {
         return Err(io::Error::other("--size must be between 0.05 and 4096 MB"));
@@ -95,7 +102,7 @@ pub fn run(opts: &BenchOptions) -> io::Result<()> {
         let size = term::size();
         let mut runner = Runner {
             input: &mut input,
-            out: io::stdout().lock(),
+            out: unbuffered_stdout()?,
             size,
             bytes: (opts.size_mb * 1e6) as usize,
             runs: opts.runs,

@@ -24,7 +24,7 @@ USAGE
   ttystorm showcase [options]        play every animation in a row (← → to skip)
   ttystorm bench [options]           every benchmark, one result screen
   ttystorm flood [options]           one benchmark workload, endlessly, for profiling a terminal
-  ttystorm compare <a.json> <b.json> …  results of several terminals side by side
+  ttystorm compare <a.json> <b.json> …  results of several terminals side by side (--markdown: a table)
   ttystorm list                      the animations and benchmarks
   ttystorm names                     every command name, one per line (to install links)
 
@@ -50,7 +50,11 @@ BENCHMARK OPTIONS
   --runs <n>      runs per test; the median is reported (default 3)
   --save <file>   write the results as JSON, for `compare`
   --label <name>  the terminal's name in the results (default: $TERM_PROGRAM)
-  --only <a,b>    (bench) run only these benchmarks
+  --details       after the results, why: stalls, read vs parse time, the terminal's CPU and memory,
+                  what the workload contains, and findings in plain words
+  --trace <file>  every write as a JSON line (test, run, time, bytes, how long it blocked)
+  --only <a,b>    (bench) run only these benchmarks, or a group: realistic, stress, all
+  --suite <name>  (bench) the same as --only <name>: realistic, stress or all
 ";
 
 const FLOOD_OPTIONS: &str = "\
@@ -111,7 +115,11 @@ fn run(args: &[String]) -> io::Result<()> {
         }
         "flood" => bench::flood(&flood_options(rest)?),
         "bench" => bench::run(&bench_options(rest)?),
-        "compare" => bench::compare(&rest.iter().map(PathBuf::from).collect::<Vec<_>>()),
+        "compare" => {
+            let markdown = rest.iter().any(|a| a == "--markdown");
+            let files: Vec<PathBuf> = rest.iter().filter(|a| *a != "--markdown").map(PathBuf::from).collect();
+            bench::compare(&files, markdown)
+        }
         name if bench::NAMES.contains(&name) => {
             if wants_help(rest) {
                 return say(&command_help(name, bench::about(name), BENCH_OPTIONS));
@@ -188,6 +196,8 @@ fn bench_options(args: &[String]) -> io::Result<bench::BenchOptions> {
         label: None,
         runs: 3,
         plain: false,
+        details: false,
+        trace: None,
     };
     let mut i = 0;
     while i < args.len() {
@@ -197,6 +207,9 @@ fn bench_options(args: &[String]) -> io::Result<bench::BenchOptions> {
                 o.only = value(args, &mut i)?.split(',').map(|n| bench::current_name(n).to_string()).collect()
             }
             "--plain" => o.plain = true,
+            "--details" => o.details = true,
+            "--suite" => o.only = vec![value(args, &mut i)?.to_string()],
+            "--trace" => o.trace = Some(PathBuf::from(value(args, &mut i)?)),
             "--save" => o.save = Some(PathBuf::from(value(args, &mut i)?)),
             "--runs" => o.runs = number(value(args, &mut i)?)? as usize,
             "--label" => o.label = Some(value(args, &mut i)?.to_string()),

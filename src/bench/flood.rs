@@ -42,7 +42,7 @@ pub fn run(opts: &FloodOptions) -> io::Result<()> {
     };
     let started = Instant::now();
     let limit = opts.seconds.map(Duration::from_secs_f64);
-    let mut out = io::stdout().lock();
+    let mut out = super::unbuffered_stdout()?;
     loop {
         for chunk in payload.writes() {
             // A blocking write: the pty's buffer is full whenever the terminal is behind, so this is
