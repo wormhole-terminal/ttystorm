@@ -232,8 +232,8 @@ impl Input {
                     ans.raw.extend_from_slice(&chunk);
                     self.take(chunk);
                 }
-                Err(RecvTimeoutError::Timeout) => break,
-                Err(RecvTimeoutError::Disconnected) => return Err(io::Error::other("stdin closed")),
+                // A closed input sends nothing more: what came before it is the answer, as at a timeout.
+                Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
             }
         }
         ans.waited = start.elapsed().as_micros() as u64;
@@ -277,8 +277,8 @@ impl Input {
                     got.raw.extend_from_slice(&chunk);
                     self.take(chunk);
                 }
-                Err(RecvTimeoutError::Timeout) => break,
-                Err(RecvTimeoutError::Disconnected) => return Err(io::Error::other("stdin closed")),
+                // A closed input sends nothing more: what came before it is the answer, as at a timeout.
+                Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
             }
         }
         Ok(got)
