@@ -18,10 +18,12 @@ brew install wormhole-terminal/tap/ttystorm   # ttystorm and a link for every co
 matrix                                  # an animation; q to quit
 logflood                                # a benchmark, with its result screen
 roundtrip --plain                       # the same without the screen: plain text, for scripts
+logflood --details                      # why: stalls, read vs parse time, the terminal's CPU and memory
+ttyprobe                                # what the terminal supports and how wide it draws emoji and CJK
 ttystorm list                           # every animation and benchmark
 ttystorm showcase                       # all the animations, 10 s each, titled as each starts
 ttystorm bench --save wormhole.json     # every benchmark, one result screen
-ttystorm compare wormhole.json ghostty.json iterm2.json
+ttystorm compare wormhole.json ghostty.json iterm2.json   # --markdown for a table to post
 ```
 
 From the source: `cargo build --release`, then link the commands somewhere on your
