@@ -77,6 +77,8 @@ done, not when the bytes reach the PTY. Each test runs 3 times (`--runs`) and re
 |---|---|---|
 | `buildlog` | a cargo-style build: `Compiling` lines with a bold green verb, warning and error blocks (`-->`, gutter, source line, colored `^^^^`), a progress bar redrawn in place with CR and EL, a `Finished` line | what `cargo build`, `make` or `npm install` print: plain text, a little color and in-place redraws |
 | `agentstream` | an AI agent's answer: bold, inline code, bullets, a fenced code block with syntax colors, a diff, and a spinner line (`✻ Thinking… (12s · ↓ 1.2k tokens)`) redrawn under it, all as **2 to 16 byte writes** | an agent streams tokens, not blocks, so this measures what each write costs. The data is capped at 2 MB, because tiny writes are slow; the result is MB/s, and `writes_per_s` is kept in `extra` |
+| `agentredraw` | a coding agent's classic UI on the main screen: a live region of 6 to 20 rows at the bottom (the reply's last rows, the spinner line, an input box, a hint line) **redrawn in full, in place, every frame** (CR, cursor up, each row erased and rewritten) as a few words arrive; finished replies are printed once above it, into the scrollback; every 200 frames the whole transcript is repainted (home, erase screen and scrollback, every row so far), as a classic renderer may after a resize, so these frames grow like a long session's. One synchronized update (mode 2026) and one write per frame, at most 1,200 frames | an agent's classic mode in a long session: a dozen styled rows resent every frame, and ever bigger repaints. The result is frames per second; `mbps` and `writes_per_s` are kept in `extra` |
+| `agentscreen` | the same agent's fullscreen UI: the alternate screen with the input box pinned at the bottom, and only changed cells sent between frames (cursor positioning plus the spinner's glyph, seconds and tokens, the words added to the reply, now and then a typed character); when the reply reaches the bottom the message area scrolls by writing the moved rows again, with no scroll region. One synchronized update and one write per frame, at most 2,400 frames | an agent's fullscreen mode: many tiny positioned writes and a burst of rewritten rows every few frames; frames per second; depends on the window size |
 | `diffscroll` | paging through a colored `git diff` in a pager: alternate screen, then page after page, each a full redraw (home, each row erased and drawn, hunk headers cyan, `+` green, `-` red) with a reverse-video status line | `git diff`, `less` and `delta`; depends on the window size |
 | `editstorm` | an editor at work: a scroll region for the text, insert and delete lines (IL, DL), insert, delete and erase characters (ICH, DCH, ECH), syntax-colored repaints, cursor moves, a status line and a command line updated often, cursor shape changes (DECSCUSR) | vim, helix and nano editing a file; depends on the window size |
 
@@ -103,10 +105,11 @@ Options: `--plain` (no status line and no result screen, the results as plain te
 per test (default 16), `--runs <n>`, `--save <file.json>`, `--label <name>`, and for `ttystorm bench`
 `--only logflood,roundtrip`. `--details` adds a diagnostics section per test after the results and
 `--trace <file>` writes every write as JSON Lines (both below). `compare` warns when the files differ in
-terminal size or machine: `diffscroll`, `editstorm`, `scrollstorm`, `cursorstorm`, `colorflood`,
-`screenswap` and `framerate` depend on the size. `ttystorm compare --markdown a.json b.json …` prints a
-markdown table instead of the screen: a row per test, a column per terminal, the best of each row in
-bold, the overall ratio to the first file last, and a note above when machines or sizes differ.
+terminal size or machine: `agentredraw`, `agentscreen`, `diffscroll`, `editstorm`, `scrollstorm`,
+`cursorstorm`, `colorflood`, `screenswap` and `framerate` depend on the size.
+`ttystorm compare --markdown a.json b.json …` prints a markdown table instead of the screen: a row per
+test, a column per terminal, the best of each row in bold, the overall ratio to the first file last, and a
+note above when machines or sizes differ.
 
 ### Why a terminal is fast or slow
 
@@ -155,9 +158,9 @@ diagnostic field changes meaning), `terminal_process` (`{pid, command, note}`, o
 `note` is `tmux`, `screen` or `ssh` when the process found is in front of the terminal), `tests`.
 
 Each test: `name`, `unit` (`MB/s`, `fps`, `µs`, `per_s`), `median`, `min`, `max`, `secs` (the median run),
-`bytes`, `timeout`, `extra` (`mbps` and `frames` or `swaps` for `framerate` and `screenswap`;
-`writes` and `writes_per_s` for `agentstream`; `p90`, `p99` and `samples` for `roundtrip`) and `diag`
-(`null` for `roundtrip` and for files saved by older versions):
+`bytes`, `timeout`, `extra` (`mbps` and `frames` or `swaps` for `framerate`, `agentredraw`, `agentscreen` and
+`screenswap`; `writes` and `writes_per_s` for `agentstream`, `agentredraw` and `agentscreen`; `p90`, `p99`
+and `samples` for `roundtrip`) and `diag` (`null` for `roundtrip` and for files saved by older versions):
 
 | `diag` field | Meaning |
 |---|---|

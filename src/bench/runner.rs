@@ -186,7 +186,7 @@ pub fn time_payload(
 
 fn unit_of(name: &str) -> Unit {
     match name {
-        "framerate" => Unit::Fps,
+        "framerate" | "agentredraw" | "agentscreen" => Unit::Fps,
         "screenswap" => Unit::PerSec,
         _ => Unit::MBps,
     }

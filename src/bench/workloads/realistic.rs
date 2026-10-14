@@ -75,7 +75,7 @@ const CRATES: [&str; 32] = [
     "wormhole-core",
 ];
 
-const PROSE: [&str; 48] = [
+pub(super) const PROSE: [&str; 48] = [
     "the",
     "function",
     "returns",
@@ -141,7 +141,7 @@ const IDENTS: [&str; 12] = [
     "next_id",
 ];
 
-fn choose<'a>(rng: &mut Rng, list: &[&'a str]) -> &'a str {
+pub(super) fn choose<'a>(rng: &mut Rng, list: &[&'a str]) -> &'a str {
     list[rng.below(list.len())]
 }
 
@@ -163,7 +163,7 @@ fn digits(mut n: usize) -> usize {
 }
 
 /// `bytes` cut to at most `max` bytes. Callers pass ASCII only.
-fn cut(s: &str, max: usize) -> &str {
+pub(super) fn cut(s: &str, max: usize) -> &str {
     &s[..s.len().min(max)]
 }
 
@@ -349,7 +349,7 @@ fn tokens(n: usize) -> String {
 }
 
 /// The status line under the answer: a spinner glyph, a verb and elapsed time and tokens.
-fn spinner(out: &mut Vec<u8>, tick: usize, produced: usize) {
+pub(super) fn spinner(out: &mut Vec<u8>, tick: usize, produced: usize) {
     const GLYPHS: [&str; 6] = ["·", "✢", "✳", "✶", "✻", "✽"];
     const VERBS: [&str; 3] = ["Thinking", "Pondering", "Cogitating"];
     push_str(out, "\r\x1b[2K\x1b[38;2;215;119;87m");
@@ -366,7 +366,7 @@ fn spinner(out: &mut Vec<u8>, tick: usize, produced: usize) {
 }
 
 /// A line of prose with bold words and inline code, about `width` cells wide.
-fn prose(rng: &mut Rng, out: &mut Vec<u8>, width: usize) {
+pub(super) fn prose(rng: &mut Rng, out: &mut Vec<u8>, width: usize) {
     let mut w = 0;
     while w < width {
         match rng.below(14) {
@@ -462,7 +462,7 @@ pub(super) fn highlight(out: &mut Vec<u8>, line: &str) {
     }
 }
 
-const CODE_BG: &str = "\x1b[48;2;40;44;52m";
+pub(super) const CODE_BG: &str = "\x1b[48;2;40;44;52m";
 
 /// One line of the answer as it is written: erase the status line it replaces, the text, and a line
 /// break. Returns the bytes for the caller to split into writes.

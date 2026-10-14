@@ -7,6 +7,7 @@
 //! Every payload leaves the terminal as it found it (SGR, scroll region, cursor shape, and the
 //! alternate screen entered and left the same number of times), so the next test starts clean.
 
+mod agent;
 mod features;
 mod realistic;
 
@@ -15,9 +16,11 @@ use crate::term::Size;
 
 /// The tests in the order they run: what real programs print, then the throughput stress tests, the
 /// feature stress tests, and the two that measure something other than bytes per second.
-pub const NAMES: [&str; 15] = [
+pub const NAMES: [&str; 17] = [
     "buildlog",
     "agentstream",
+    "agentredraw",
+    "agentscreen",
     "diffscroll",
     "editstorm",
     "logflood",
@@ -34,7 +37,8 @@ pub const NAMES: [&str; 15] = [
 ];
 
 /// The tests that are what real programs print, as opposed to stress tests.
-pub const REALISTIC: [&str; 4] = ["buildlog", "agentstream", "diffscroll", "editstorm"];
+pub const REALISTIC: [&str; 6] =
+    ["buildlog", "agentstream", "agentredraw", "agentscreen", "diffscroll", "editstorm"];
 
 /// The named groups `--only` and `suite` accept: `realistic`, `stress` (everything else but
 /// `roundtrip`) and `all`.
@@ -52,6 +56,8 @@ pub fn about(name: &str) -> &'static str {
     match name {
         "buildlog" => "a cargo-style build: colored lines, diagnostics, a progress bar redrawn in place",
         "agentstream" => "an AI agent's answer as 2-16 byte writes, up to 2 MB (per-write cost)",
+        "agentredraw" => "a coding agent's classic UI: live region redrawn in place, transcript repainted",
+        "agentscreen" => "a coding agent's fullscreen UI: alternate screen, synchronized cell diffs",
         "diffscroll" => "paging through a colored git diff in a pager, a full redraw per page",
         "editstorm" => "an editor at work: scroll region, insert/delete lines and chars, status line",
         "logflood" => "plain log lines, like cat of a big file",
@@ -97,10 +103,11 @@ fn seed_of(name: &str) -> u64 {
 #[derive(Default)]
 pub struct Payload {
     pub bytes: Vec<u8>,
-    /// Screens drawn: frames for `framerate`, swaps for `screenswap`.
+    /// Screens drawn: frames for `framerate` and the agent redraws, swaps for `screenswap`.
     pub frames: usize,
-    /// The size of each write, when the test is about writes rather than bytes (`agentstream`). They
-    /// add up to `bytes.len()`. `None`: the bytes go out in `CHUNK`-sized writes.
+    /// The size of each write, when the test is about writes rather than bytes (`agentstream`, and a
+    /// frame per write for the agent redraws). They add up to `bytes.len()`. `None`: the bytes go out
+    /// in `CHUNK`-sized writes.
     pub chunks: Option<Vec<usize>>,
 }
 
@@ -155,6 +162,16 @@ pub fn payload(name: &str, size: Size, target: usize) -> Option<Payload> {
         "buildlog" => realistic::buildlog(&mut rng, &mut out, target),
         "agentstream" => {
             chunks = Some(realistic::agentstream(&mut rng, &mut out, target.min(AGENT_MAX_BYTES), size))
+        }
+        "agentredraw" => {
+            let sizes = agent::agentredraw(&mut rng, &mut out, target, size);
+            frames = sizes.len();
+            chunks = Some(sizes);
+        }
+        "agentscreen" => {
+            let sizes = agent::agentscreen(&mut rng, &mut out, target, size);
+            frames = sizes.len();
+            chunks = Some(sizes);
         }
         "diffscroll" => realistic::diffscroll(&mut rng, &mut out, target, size),
         "editstorm" => realistic::editstorm(&mut rng, &mut out, target, size),
@@ -488,7 +505,8 @@ mod tests {
 
     #[test]
     fn every_throughput_test_reaches_its_size() {
-        for name in NAMES.iter().filter(|n| !["roundtrip", "framerate", "screenswap"].contains(n)) {
+        let by_frames = ["roundtrip", "framerate", "screenswap", "agentredraw", "agentscreen"];
+        for name in NAMES.iter().filter(|n| !by_frames.contains(n)) {
             let p = make(name, 200_000);
             assert!(p.bytes.len() >= 200_000, "{name}: {}", p.bytes.len());
             assert!(p.bytes.len() < 200_000 + 120_000, "{name} overshoots: {}", p.bytes.len());
@@ -613,6 +631,13 @@ mod tests {
         let p = make("screenswap", 1_000_000);
         assert!(p.frames >= 30);
         assert!(make("framerate", 1_000_000).frames >= 30);
+        for name in ["agentredraw", "agentscreen"] {
+            let p = make(name, 1_000_000);
+            assert!(p.frames >= 30, "{name}: {}", p.frames);
+            // One write per frame.
+            assert_eq!(p.chunks.as_ref().map(Vec::len), Some(p.frames), "{name}");
+            assert_eq!(p.write_count(), p.frames, "{name}");
+        }
         assert_eq!(make("buildlog", 10_000).frames, 0);
     }
 

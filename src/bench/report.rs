@@ -64,10 +64,13 @@ pub fn push_value(l: &mut Line, t: &TestResult, width: usize) {
     l.pad(width.saturating_sub(used)).bold(&num, TEXT).text(&format!(" {unit}"), DIM);
 }
 
-/// The section a result sits under: real-world output apart from the stress tests that share its unit.
+/// The section a result sits under: real-world output apart from the stress tests that share its unit
+/// (the agent redraws are measured in frames per second but are what a program prints all the same).
 fn section(t: &TestResult) -> &'static str {
     match t.unit {
-        Unit::MBps if super::workloads::REALISTIC.contains(&t.name.as_str()) => "REAL-WORLD OUTPUT",
+        Unit::MBps | Unit::Fps if super::workloads::REALISTIC.contains(&t.name.as_str()) => {
+            "REAL-WORLD OUTPUT"
+        }
         Unit::MBps => "THROUGHPUT",
         Unit::Fps => "FULL-SCREEN REDRAWS",
         Unit::PerSec => "SCREEN SWAPS",

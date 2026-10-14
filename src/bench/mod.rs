@@ -211,7 +211,10 @@ mod tests {
     #[test]
     fn only_takes_groups() {
         let realistic = selected(&["realistic".to_string()]).unwrap_or_default();
-        assert_eq!(realistic, vec!["buildlog", "agentstream", "diffscroll", "editstorm"]);
+        assert_eq!(
+            realistic,
+            vec!["buildlog", "agentstream", "agentredraw", "agentscreen", "diffscroll", "editstorm"]
+        );
         let stress = selected(&["stress".to_string()]).unwrap_or_default();
         assert!(
             stress.contains(&"logflood") && stress.contains(&"screenswap") && !stress.contains(&"roundtrip")
@@ -219,8 +222,8 @@ mod tests {
         assert!(!stress.contains(&"buildlog"));
         assert_eq!(selected(&["all".to_string()]).unwrap_or_default().len(), workloads::NAMES.len());
         let mixed = selected(&["roundtrip".to_string(), "realistic".to_string()]).unwrap_or_default();
-        assert_eq!(mixed.len(), 5);
-        assert_eq!(mixed[4], "roundtrip");
+        assert_eq!(mixed.len(), 7);
+        assert_eq!(mixed[6], "roundtrip");
     }
 
     #[test]
