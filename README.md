@@ -71,6 +71,10 @@ every terminal gets the same ones), then asks for the cursor position (DSR 6). A
 only after it has parsed everything before the question, so the clock stops when the work is really
 done, not when the bytes reach the PTY. Each test runs 3 times (`--runs`) and reports the median.
 
+A speed is only reported for a terminal that was seen to parse the payload: queries are woven into it, and a
+terminal that did not answer them all gets "dropped input" instead of a number
+([Is the number real?](#is-the-number-real-the-input-check)).
+
 **Realistic**: what programs actually print. These are the numbers that predict how a terminal feels in daily use.
 
 | Command | Workload | Why it is realistic |
@@ -103,13 +107,109 @@ test); names and groups can be mixed: `--only realistic,roundtrip`.
 
 Options: `--plain` (no status line and no result screen, the results as plain text), `--size <MB>`
 per test (default 16), `--runs <n>`, `--save <file.json>`, `--label <name>`, and for `ttystorm bench`
-`--only logflood,roundtrip`. `--details` adds a diagnostics section per test after the results and
+`--only logflood,roundtrip`. `--no-verify` and `--verify-every <KiB>` set the input check (below). `--details` adds a diagnostics section per test after the results and
 `--trace <file>` writes every write as JSON Lines (both below). `compare` warns when the files differ in
 terminal size or machine: `agentredraw`, `agentscreen`, `diffscroll`, `editstorm`, `scrollstorm`,
 `cursorstorm`, `colorflood`, `screenswap` and `framerate` depend on the size.
 `ttystorm compare --markdown a.json b.json …` prints a markdown table instead of the screen: a row per
 test, a column per terminal, the best of each row in bold, the overall ratio to the first file last, and a
 note above when machines or sizes differ.
+
+### Is the number real? The input check
+
+The cursor report that ends a run is not enough on its own. A terminal can read every byte from the PTY and
+parse a small part of it (a ring buffer overwritten every tick, a queue that sheds load), and it still
+answers the cursor report, and fast, because the question is in the newest bytes, which it kept. Its
+cursor position even looks right after plain text. The speed it posts is then how fast it throws input
+away.
+
+So ttystorm asks along the way, and counts the answers.
+
+**Checkpoints.** At intervals through the payload the writer adds `ESC [ 5 n` (DSR 5, "status report"), which
+a terminal answers with `ESC [ 0 n`. At the end the answers are counted. All of them: the run is
+*verified*. Fewer: the terminal did not take in what it was sent, and the test is reported as
+**dropped input**, with no number, on the screen, in `--plain`, in `compare` (where it never wins and is
+left out of the overall ratio), and in the `--save` file (`check.status` is `dropped`). More answers
+than questions are not a witness either: the run is marked *unverified*.
+
+**The method, exactly.**
+
+- *The payload is never changed.* It is the same bytes for every terminal and every run. A checkpoint is
+  four bytes that follow a byte of it. The rate is computed from the payload alone; the checkpoint bytes
+  are not in it.
+- *Where.* The distance between checkpoints is drawn from the clock for each run, between 128 and 384 KiB
+  (`--verify-every <KiB>` moves the middle of that range, default 256; it is rounded up to the end
+  of a write, see below), so about 60 per 16 MB run, and it is cut to a 32nd of the payload for a small one. The positions change from run to run on purpose: a
+  terminal that reads in fixed ticks and keeps the end of each would otherwise see every query at the
+  same place in its tick. A checkpoint is never put where a sequence or a character is open: not after
+  an `ESC`, not inside a CSI, OSC, DCS or APC, not in the middle of a UTF-8 character (a scanner of
+  its own decides, and errs on the side of "still open"). Where the payload brings its own writes
+  (`agentstream`'s tokens, the agents' frames) a checkpoint rides on the end of one; for the others, on
+  the end of a 64 KiB write, which then runs on to the next safe byte (so a payload has at most one
+  checkpoint per write, and one of 50 KB has one, at its end). The last checkpoint is the end of the payload
+  when it ends between sequences, right before the cursor report. The warm-up is not checked; the
+  measured runs are, each with its own.
+- *How the answers are counted.* Each `ESC [ 0 n` is taken out of what the terminal sends and counted, wherever
+  it comes: before the cursor report, split across two reads, or long after (a terminal that answers
+  from another thread gets 3 s after the cursor report for stragglers; that wait is after the clock stopped).
+  Nothing else in the stream is touched, so the cursor report and the DA1 sentinel are read as before.
+  Answers are identical, so they are counted, not matched to the checkpoints.
+- *Is the terminal a fair witness?* Before the first measured test, with the terminal idle, ttystorm
+  sends 16 DSR 5 queries in a row and then DA1 (which comes after them). All 16 answers: go on. None:
+  the terminal doesn't speak DSR 5, and the numbers are shown as *unverified* ("not verified: the
+  terminal does not answer DSR 5"), not failed. Some: it can't be counted on (it coalesces or rate-limits
+  its answers), also *unverified*. So a terminal is never marked as dropping input because it
+  cannot answer.
+
+**What it proves.** A checkpoint that was answered was in the stream, reached the terminal's parser in the
+right place, and was recognised. A terminal that loses a stretch of input containing a checkpoint is
+caught for certain; one that loses stretches that are shorter than the gap between checkpoints
+is caught with a probability that is about the fraction of the stream it lost: with 60 checkpoints (a 16 MB
+run), losing 5% of the bytes in short spans at places that don't depend on the query is noticed 95% of
+the time in a run, losing 1% 45% of the time (each of the runs gets its own chance). A terminal that keeps only
+the tail of every read, as a refterm-style ring does, loses nearly all checkpoints and is caught
+at once (checked against a stand-in that does exactly that).
+
+**What it cannot prove.**
+
+- *A terminal that recognises the query* and answers it without parsing the rest passes. No query
+  in the stream can tell, since the terminal decides what it answers. The check is a tripwire for
+  terminals that lose input by design or under load, not a proof against one written to pass it. If that
+  is the question, read the terminal's source.
+- *Parsed is not drawn.* Nothing here says the screen shows what was written; that was never what
+  the benchmark measured (see "What it doesn't measure" below).
+- *Answers early or out of order.* A terminal that answers a query when it reads it, from an I/O thread,
+  before its parser reaches it, still passes while parsing less. Replies are counted, not matched to
+  positions, so a reply to checkpoint 40 standing in for checkpoint 10 is the same to the count.
+- *Short losses between checkpoints* may go unnoticed (the probability above). The check cannot be made
+  denser than one checkpoint per write (64 KiB, or a token or a frame for the payloads that bring their
+  own writes; `--verify-every 64` asks for that), so a terminal that drops a tenth of a percent of its
+  input is not reliably caught.
+- *A terminal that answers late or not at all under load* (it holds answers longer than 3 s after the cursor
+  report, rate-limits them, or merges them) looks like one that dropped input; the idle burst test
+  catches the first kind of coalescing, not a limit that only bites under load. `dropped input` with most
+  checkpoints answered is worth a second look with `--details`.
+- *tmux, screen, ssh and the like* answer queries themselves: through them the check, like the
+  timing, describes the multiplexer.
+- `roundtrip` sends no payload and is not checked, and neither are the animations or `flood`.
+
+**What it costs, and how to see it.** The checkpoints are inside the timed run, so they cost what they cost:
+
+- Bytes: 4 sent and 4 received per checkpoint, 0.0016% of a 16 MB run at the default distance.
+- The writer: no write call of its own (the query is the second part of the `writev` of the write it
+  ends), and the number of writes does not change. A write that carries one is up to one line or sequence
+  longer. The trace marks those writes (`"checkpoint":true`).
+- The terminal: parsing a four-byte sequence and answering it, one small `write` to the PTY each: a few
+  microseconds, about 64 times in a run that lasts tens of milliseconds at best. That is a fraction of a
+  percent to a percent for the fastest terminals and nothing for the rest; the figure is an estimate.
+  Measure it on the terminal in question: `logflood --no-verify` against `logflood` (the first has no
+  checkpoints and says "unverified"). `--details` says how many bytes and answers a run had.
+- The wait for stragglers happens after the clock has stopped, and only when an answer is missing.
+
+Files: `check_every_bytes` at the top level of a `--save` file, and per test `check`:
+`{"status": "verified"|"dropped"|"unchecked", "checkpoints": n, "answered": n}`, and for `unchecked` a
+`reason` (`off`, `silent`, `lossy`, `surplus`, `nowhere`). A test with `status: dropped` has `median: 0`.
+`null` for `roundtrip` and for files from before the check.
 
 ### Why a terminal is fast or slow
 
@@ -153,12 +253,12 @@ What it measures, and how to read it:
 terminal. The fields:
 
 `--save` file, top level: `format` (`ttystorm`), `format_version` (1), `tool_version`, `label`,
-`terminal`, `cols`, `rows`, `machine`, `date`, `size_mb`, `runs`, `diag_version` (1; it changes when a
+`terminal`, `cols`, `rows`, `machine`, `date`, `size_mb`, `runs`, `check_every_bytes` (`null` with `--no-verify`), `diag_version` (1; it changes when a
 diagnostic field changes meaning), `terminal_process` (`{pid, command, note}`, or `null` when not found;
 `note` is `tmux`, `screen` or `ssh` when the process found is in front of the terminal), `tests`.
 
 Each test: `name`, `unit` (`MB/s`, `fps`, `µs`, `per_s`), `median`, `min`, `max`, `secs` (the median run),
-`bytes`, `timeout`, `extra` (`mbps` and `frames` or `swaps` for `framerate`, `agentredraw`, `agentscreen` and
+`bytes`, `timeout`, `check` (see above), `extra` (`mbps` and `frames` or `swaps` for `framerate`, `agentredraw`, `agentscreen` and
 `screenswap`; `writes` and `writes_per_s` for `agentstream`, `agentredraw` and `agentscreen`; `p90`, `p99`
 and `samples` for `roundtrip`) and `diag` (`null` for `roundtrip` and for files saved by older versions):
 
@@ -178,12 +278,12 @@ and `samples` for `roundtrip`) and `diag` (`null` for `roundtrip` and for files 
 The `--trace` file is JSON Lines, one event per write of every measured run (not the warm-up):
 
 ```json
-{"test":"logflood","run":1,"event":"write","t_ms":12.345,"bytes":65536,"write_ms":0.412,"cum_bytes":131072}
+{"test":"logflood","run":1,"event":"write","t_ms":12.345,"bytes":65536,"write_ms":0.412,"cum_bytes":131072,"checkpoint":false}
 {"test":"logflood","run":1,"event":"dsr","t_ms":40.1,"wait_ms":6.2,"cum_bytes":16000512}
 ```
 
 `t_ms` is when the write returned, counted from the start of the run; `write_ms` is how long it took;
-`cum_bytes` the bytes written so far. The last line of a run is the answer: `t_ms` is the run's total and
+`cum_bytes` the bytes written so far (of the payload: not counting the checkpoints' four bytes each), `checkpoint` whether the input check's query followed the write's data. The last line of a run is the answer: `t_ms` is the run's total and
 `wait_ms` the parse tail. Plot `cum_bytes` against `t_ms` to see the terminal's pace, or `write_ms` to
 see the stalls. A 16 MB test makes a few hundred lines per run, but `agentstream` makes one for every
 tiny write (hundreds of thousands): trace it alone with `--runs 1`.

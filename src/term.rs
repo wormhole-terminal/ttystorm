@@ -116,6 +116,9 @@ pub struct Input {
     started: Instant,
     /// Every chunk read, with when it came, when `record_raw` asked for it (`ttyprobe --raw`).
     tap: Option<Vec<String>>,
+    /// Set by `count_status_replies`: `ESC [ 0 n` is taken out of what is read and counted.
+    counting: bool,
+    status_replies: u64,
 }
 
 impl Input {
@@ -139,8 +142,15 @@ impl Input {
     }
 
     /// An input fed from a channel instead of stdin: what the tests use.
-    fn with_receiver(rx: Receiver<Vec<u8>>) -> Self {
-        Self { rx, pending: Vec::new(), started: Instant::now(), tap: None }
+    pub(crate) fn with_receiver(rx: Receiver<Vec<u8>>) -> Self {
+        Self {
+            rx,
+            pending: Vec::new(),
+            started: Instant::now(),
+            tap: None,
+            counting: false,
+            status_replies: 0,
+        }
     }
 
     /// Starts keeping every byte read, escaped and timed, for `raw_log`.
@@ -159,6 +169,44 @@ impl Input {
             tap.push(format!("+{:.3} ms  {}", self.started.elapsed().as_secs_f64() * 1e3, escape(&chunk)));
         }
         self.pending.extend_from_slice(&chunk);
+        if self.counting {
+            self.status_replies += strip_status_replies(&mut self.pending);
+        }
+    }
+
+    /// From now on every device status report `ESC [ 0 n` (the answer to DSR 5) is removed from what
+    /// is read and counted instead, wherever it comes: before a cursor report, split across two reads,
+    /// or long after the question. Nothing else in the stream is touched.
+    pub fn count_status_replies(&mut self) {
+        self.counting = true;
+    }
+
+    /// The status reports counted since the last call, and the count starts again.
+    pub fn take_status_replies(&mut self) -> u64 {
+        while let Ok(chunk) = self.rx.try_recv() {
+            self.take(chunk);
+        }
+        std::mem::take(&mut self.status_replies)
+    }
+
+    /// Waits until `want` status reports have been counted since the last `take_status_replies`, or
+    /// `timeout` has passed, and returns how many there are. It does not reset the count.
+    pub fn wait_status_replies(&mut self, want: u64, timeout: Duration) -> u64 {
+        let deadline = Instant::now() + timeout;
+        loop {
+            while let Ok(chunk) = self.rx.try_recv() {
+                self.take(chunk);
+            }
+            if self.status_replies >= want {
+                break;
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            match self.rx.recv_timeout(left) {
+                Ok(chunk) => self.take(chunk),
+                Err(_) => break,
+            }
+        }
+        self.status_replies
     }
 
     /// The keys pressed since the last call, never blocking.
@@ -460,6 +508,27 @@ pub fn escape(bytes: &[u8]) -> String {
     s
 }
 
+/// Removes every `ESC [ 0 n` from `buf` and returns how many there were. A report cut in two stays
+/// in the buffer until the rest arrives (the caller appends to the same buffer).
+fn strip_status_replies(buf: &mut Vec<u8>) -> u64 {
+    const REPORT: &[u8] = b"\x1b[0n";
+    let mut found = 0;
+    let mut kept = 0;
+    let mut i = 0;
+    while i < buf.len() {
+        if buf[i..].starts_with(REPORT) {
+            found += 1;
+            i += REPORT.len();
+        } else {
+            buf[kept] = buf[i];
+            kept += 1;
+            i += 1;
+        }
+    }
+    buf.truncate(kept);
+    found
+}
+
 /// A cursor position report found in a buffer: where it sits and what it says.
 struct Cpr {
     start: usize,
@@ -556,6 +625,44 @@ mod tests {
     fn finds_a_cursor_report_among_other_bytes() {
         assert_eq!(find_cpr(b"q\x1b[12;40R"), Some(9));
         assert_eq!(find_cpr(b"\x1b[12;40"), None);
+    }
+
+    #[test]
+    fn status_reports_are_counted_and_taken_out_wherever_they_sit() {
+        let mut buf = b"a\x1b[0n\x1b[0n\x1b[12;3Rb\x1b[0".to_vec();
+        assert_eq!(strip_status_replies(&mut buf), 2);
+        assert_eq!(buf, b"a\x1b[12;3Rb\x1b[0");
+        // The rest of a split report arrives in the next read and is found then.
+        buf.extend_from_slice(b"n");
+        assert_eq!(strip_status_replies(&mut buf), 1);
+        assert_eq!(buf, b"a\x1b[12;3Rb");
+        // Other reports that look alike are left alone.
+        let mut other = b"\x1b[3n\x1b[?0n\x1b[10n".to_vec();
+        assert_eq!(strip_status_replies(&mut other), 0);
+    }
+
+    #[test]
+    fn counting_leaves_the_cursor_report_for_sync_to_find() {
+        let (tx, rx) = mpsc::channel();
+        let mut input = Input::with_receiver(rx);
+        input.count_status_replies();
+        let _ = tx.send(b"\x1b[0n\x1b[".to_vec());
+        let _ = tx.send(b"0n\x1b[4;1R".to_vec());
+        let mut sink = Vec::new();
+        assert!(input.sync(&mut sink, Duration::from_secs(2)).expect("sync").is_some());
+        assert_eq!(input.take_status_replies(), 2);
+        assert_eq!(input.take_status_replies(), 0);
+    }
+
+    #[test]
+    fn waiting_for_status_reports_gives_up_with_the_count_so_far() {
+        let (tx, rx) = mpsc::channel();
+        let mut input = Input::with_receiver(rx);
+        input.count_status_replies();
+        let _ = tx.send(b"\x1b[0n".to_vec());
+        assert_eq!(input.wait_status_replies(2, Duration::from_millis(50)), 1);
+        let _ = tx.send(b"\x1b[0n".to_vec());
+        assert_eq!(input.wait_status_replies(2, Duration::from_millis(50)), 2);
     }
 
     #[test]

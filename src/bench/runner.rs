@@ -5,6 +5,9 @@
 //! so the time to the answer is the time the terminal took to consume the whole payload, not the
 //! time the kernel took to buffer it.
 //!
+//! Along the way the payload carries checkpoints (see `integrity`): a terminal that did not parse all of
+//! it is reported as having dropped input, not given a speed.
+//!
 //! Every write is timed too: a write that blocks is the terminal not reading, and the wait for the
 //! answer after the last write is the terminal still parsing (see `diag`).
 
@@ -14,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use super::compose;
 use super::diag::{self, RunDiag, TestDiag, Timed, WriteEvent};
+use super::integrity::{self, Check, Plan, Verifier};
 use super::procinfo::{self, Terminal};
 use super::results::{TestResult, Unit};
 use super::stats;
@@ -43,6 +47,8 @@ pub struct Runner<'a, W: Write> {
     pub process: Option<Terminal>,
     /// Every write of every measured run, as JSON Lines (`--trace`).
     pub trace: Option<BufWriter<File>>,
+    /// The input check: the checkpoints in each run's payload, and their count at the end.
+    pub verifier: Verifier,
 }
 
 pub enum Step {
@@ -84,11 +90,14 @@ impl<W: Write> Runner<'_, W> {
 
         // Warm up: fonts, glyph caches and the pty buffers are cold on the first bytes.
         self.reset()?;
-        if time_payload(self.input, &mut self.out, &warm, RUN_TIMEOUT)?.is_none() {
+        if time_payload(self.input, &mut self.out, &warm, &Plan::none(), RUN_TIMEOUT)?.is_none() {
             return Ok(Step::Done(Box::new(timeout_result(name, &main))));
         }
 
         let composition = compose::analyze(&main.bytes, main.write_count());
+        // Asked once, with the terminal idle, before the first number depends on the answer.
+        let unchecked = self.verifier.unchecked(self.input, &mut self.out)?;
+        let mut checks = Vec::new();
         let mut rates = Vec::new();
         let mut times = Vec::new();
         let mut runs = Vec::new();
@@ -99,11 +108,22 @@ impl<W: Write> Runner<'_, W> {
             if !self.reset()? {
                 return Ok(Step::Done(Box::new(timeout_result(name, &main))));
             }
+            // Planned before the clock starts: finding the places takes a pass over the payload.
+            let plan = self.verifier.plan(&main, unchecked.is_none());
+            self.verifier.begin(self.input);
             let before = self.process.as_ref().and_then(|p| procinfo::sample(p.pid));
-            let Some(timed) = time_payload(self.input, &mut self.out, &main, RUN_TIMEOUT)? else {
+            let Some(timed) = time_payload(self.input, &mut self.out, &main, &plan, RUN_TIMEOUT)? else {
                 return Ok(Step::Done(Box::new(timeout_result(name, &main))));
             };
             let after = self.process.as_ref().and_then(|p| procinfo::sample(p.pid));
+            // After the clock stopped: waiting for stragglers here costs the measurement nothing.
+            if unchecked.is_none() {
+                let check = self.verifier.finish(self.input, &plan);
+                if check.is_dropped() {
+                    return Ok(Step::Done(Box::new(dropped_result(name, &main, check))));
+                }
+                checks.push(check);
+            }
             if let Some(trace) = &mut self.trace {
                 diag::write_trace(trace, name, run + 1, &timed)?;
             }
@@ -116,7 +136,13 @@ impl<W: Write> Runner<'_, W> {
             self.status(&format!("{head}  run {}/{}  {:.1} {}", run + 1, self.runs, rate, unit.label()))?;
         }
         let diag = TestDiag { composition, runs, median_run: nearest(&rates, stats::median(&rates)) };
-        Ok(Step::Done(Box::new(throughput_result(name, &main, &rates, &times, Some(diag)))))
+        let check = match unchecked {
+            Some(why) => Some(Check::Unchecked(why)),
+            None => Check::merge(&checks),
+        };
+        let mut result = throughput_result(name, &main, &rates, &times, Some(diag));
+        result.check = check;
+        Ok(Step::Done(Box::new(result)))
     }
 
     fn latency(&mut self, head: &str) -> io::Result<Step> {
@@ -141,8 +167,9 @@ impl<W: Write> Runner<'_, W> {
     }
 }
 
-/// Writes `payload` and returns how long until the terminal had parsed all of it, and the timing of
-/// every write, or `None` when it took longer than `timeout`.
+/// Writes `payload` and returns how long until the terminal had answered the cursor report after it,
+/// and the timing of every write, or `None` when it took longer than `timeout`. The `plan`'s
+/// checkpoints ride on the writes; they are not part of the payload and not counted in its bytes.
 ///
 /// Each write is flushed so it is one call to the kernel: that is what is timed, and on a PTY a
 /// write only returns when the terminal has read enough to make room.
@@ -150,20 +177,22 @@ pub fn time_payload(
     input: &mut Input,
     out: &mut impl Write,
     payload: &Payload,
+    plan: &Plan,
     timeout: Duration,
 ) -> io::Result<Option<Timed>> {
     let mut events = Vec::with_capacity(payload.write_count());
     let start = Instant::now();
     let deadline = start + timeout;
     let mut last = start;
-    for chunk in payload.writes() {
-        out.write_all(chunk)?;
+    for step in integrity::steps(payload, plan) {
+        integrity::write_step(out, step)?;
         out.flush()?;
         let now = Instant::now();
         events.push(WriteEvent {
             end_ns: (now - start).as_nanos() as u64,
             took_ns: (now - last).as_nanos() as u64,
-            bytes: chunk.len(),
+            bytes: step.data.len(),
+            checkpoint: step.query,
         });
         last = now;
         if now > deadline {
@@ -240,6 +269,7 @@ fn throughput_result(
         timeout: false,
         extra,
         diag,
+        check: None,
     }
 }
 
@@ -255,6 +285,25 @@ fn timeout_result(name: &str, p: &Payload) -> TestResult {
         timeout: true,
         extra: Vec::new(),
         diag: None,
+        check: None,
+    }
+}
+
+/// A run whose checkpoints went unanswered: no speed is reported, because the time measured how fast
+/// the terminal threw input away.
+fn dropped_result(name: &str, p: &Payload, check: Check) -> TestResult {
+    TestResult {
+        name: name.to_string(),
+        unit: unit_of(name),
+        median: 0.0,
+        min: 0.0,
+        max: 0.0,
+        secs: 0.0,
+        bytes: p.bytes.len() as u64,
+        timeout: false,
+        extra: Vec::new(),
+        diag: None,
+        check: Some(check),
     }
 }
 
@@ -270,6 +319,7 @@ fn latency_timeout() -> TestResult {
         timeout: true,
         extra: Vec::new(),
         diag: None,
+        check: None,
     }
 }
 
@@ -292,6 +342,7 @@ fn latency_result(micros: &[f64]) -> TestResult {
             ("samples".to_string(), sorted.len() as f64),
         ],
         diag: None,
+        check: None,
     }
 }
 

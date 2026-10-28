@@ -3,6 +3,7 @@
 //! than the first file each one is. `--markdown` prints the same as a table to paste into an issue
 //! or a README instead.
 
+use super::integrity::Check;
 use super::report::{push_value, value_parts};
 use super::results::{Results, TestResult};
 use super::ui::{BAD, DIM, FAINT, GOOD, Line, Panel, TEXT, fit};
@@ -34,7 +35,7 @@ fn find<'a>(r: &'a Results, name: &str) -> Option<&'a TestResult> {
 fn best_of(all: &[Results], name: &str) -> Option<usize> {
     let mut best: Option<(usize, &TestResult)> = None;
     for (i, r) in all.iter().enumerate() {
-        let Some(t) = find(r, name).filter(|t| !t.timeout && t.median > 0.0) else {
+        let Some(t) = find(r, name).filter(|t| t.unusable().is_none() && t.median > 0.0) else {
             continue;
         };
         let better = match best {
@@ -144,7 +145,17 @@ fn warnings(all: &[Results]) -> Vec<&'static str> {
     if !same(|r| format!("{}×{}", r.cols, r.rows)) {
         warnings.push("Terminal sizes differ, which changes the scrolling, cursor and frame tests.");
     }
+    if all.iter().flat_map(|r| &r.tests).any(unverified) {
+        warnings.push(
+            "Numbers marked † are not verified: the input check could not run or decide for them, so a terminal that dropped input would not show.",
+        );
+    }
     warnings
+}
+
+/// Whether a usable number comes without the input check's word.
+fn unverified(t: &TestResult) -> bool {
+    t.unusable().is_none() && matches!(t.check, Some(Check::Unchecked(_)))
 }
 
 /// A cell's text in a markdown table: the unit with the number, `|` kept from ending the cell.
@@ -155,10 +166,12 @@ fn escape_cell(s: &str) -> String {
 fn markdown_cell(t: Option<&TestResult>, best: bool) -> String {
     match t {
         None => "—".to_string(),
-        Some(t) if t.timeout => "timed out".to_string(),
+        Some(t) if t.unusable().is_some() => t.unusable().unwrap_or_default().to_string(),
         Some(t) => {
             let (num, unit) = value_parts(t);
-            if best { format!("**{num} {unit}**") } else { format!("{num} {unit}") }
+            // A number the input check could not vouch for carries a dagger; the note says what it means.
+            let mark = if unverified(t) { " †" } else { "" };
+            if best { format!("**{num} {unit}**{mark}") } else { format!("{num} {unit}{mark}") }
         }
     }
 }
@@ -253,7 +266,7 @@ pub fn compare_panel(all: &[Results], width: usize) -> Panel {
             let t = find(r, &name);
             let ratio = t.zip(base_t).and_then(|(t, b)| t.better_than(b));
             let row = match (t, best_t) {
-                (Some(t), Some(b)) if !t.timeout && t.median > 0.0 => {
+                (Some(t), Some(b)) if t.unusable().is_none() && t.median > 0.0 => {
                     // The best fills the bar; the others are as long as they are good compared with it.
                     let frac = b.better_than(t).map(|x| 1.0 / x).unwrap_or(0.0).clamp(0.0, 1.0);
                     let is_best = best == Some(i);
@@ -267,7 +280,9 @@ pub fn compare_panel(all: &[Results], width: usize) -> Panel {
                         "",
                     )
                 }
-                (Some(t), _) if t.timeout => terminal_row(&c, &r.label, false, None, None, None, "timed out"),
+                (Some(t), _) if t.unusable().is_some() => {
+                    terminal_row(&c, &r.label, false, None, None, None, t.unusable().unwrap_or_default())
+                }
                 _ => terminal_row(&c, &r.label, false, None, None, None, "not measured"),
             };
             p.push(row);
@@ -427,5 +442,25 @@ mod tests {
         let mut odd = three();
         odd[0].label = "a|b".to_string();
         assert!(compare_markdown(&odd).contains("a\\|b"));
+    }
+
+    #[test]
+    fn dropped_input_never_wins_and_unverified_numbers_carry_a_dagger() {
+        use super::super::integrity::Why;
+        let mut all = three();
+        // The fast file dropped input: its (absurd) number is gone and the slower ones compare alone.
+        all[1].tests[0].check = Some(Check::Dropped { answered: 1, checkpoints: 48 });
+        all[1].tests[0].median = 0.0;
+        all[0].tests[1].check = Some(Check::Unchecked(Why::Silent));
+        assert_eq!(best_of(&all, "logflood"), Some(0));
+        let md = compare_markdown(&all);
+        let logflood = md.lines().find(|l| l.starts_with("| logflood")).unwrap_or_default();
+        assert!(logflood.contains("dropped input") && logflood.contains("**800 MB/s**"), "{logflood}");
+        let colorflood = md.lines().find(|l| l.starts_with("| colorflood")).unwrap_or_default();
+        assert!(colorflood.contains("†"), "{colorflood}");
+        assert!(md.contains("> Note: Numbers marked †"), "{md}");
+        let mut out = Vec::new();
+        compare_panel(&all, 100).write(&mut out);
+        assert!(String::from_utf8_lossy(&out).contains("dropped input"));
     }
 }
