@@ -41,6 +41,9 @@ pub const QUERY_BYTES: u64 = plan::QUERY.len() as u64;
 /// their way. A terminal that answers in order has none outstanding; one that answers from another
 /// thread may be a little behind. Paid only when an answer is missing.
 const SETTLE: Duration = Duration::from_secs(3);
+/// How long a run that missed answers is given in a second look, and in a repeat of the run: a terminal that
+/// answers slowly, or limits its answers under load, must not be accused of dropping input for that.
+const PATIENCE: Duration = Duration::from_secs(10);
 
 /// Whether the terminal is a fair witness (`probe`).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -57,18 +60,25 @@ pub struct Verifier {
     every: Option<usize>,
     fit: Fitness,
     settle: Duration,
+    patience: Duration,
     seed: u64,
 }
 
 impl Verifier {
     pub fn new(every: Option<usize>) -> Self {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(1, |d| d.as_nanos() as u64);
-        Self { every, fit: Fitness::Unknown, settle: SETTLE, seed: now }
+        Self { every, fit: Fitness::Unknown, settle: SETTLE, patience: PATIENCE, seed: now }
     }
 
     #[cfg(test)]
-    fn for_test(every: usize) -> Self {
-        Self { every: Some(every), fit: Fitness::Unknown, settle: Duration::from_millis(60), seed: 99 }
+    pub(crate) fn for_test(every: usize) -> Self {
+        Self {
+            every: Some(every),
+            fit: Fitness::Unknown,
+            settle: Duration::from_millis(60),
+            patience: Duration::from_millis(500),
+            seed: 99,
+        }
     }
 
     /// Why the check can't run, `None` when it can. The first call asks the terminal (see `probe`).
@@ -105,13 +115,44 @@ impl Verifier {
 
     /// Call after the run was timed (so waiting here costs the measurement nothing): counts the answers,
     /// waiting for stragglers only when some are missing. `asked` is how many queries the run really
-    /// wrote, not how many were planned.
+    /// wrote, not how many were planned. When the verdict is "dropped" the count is kept, for
+    /// `late_answers`.
     pub fn finish(&mut self, input: &mut Input, asked: u64) -> Check {
-        let answered = input.wait_status_replies(asked, self.settle);
+        let check = Check::judge(asked, input.wait_status_replies(asked, self.settle));
+        if !check.is_dropped() {
+            input.take_status_replies();
+        }
+        check
+    }
+
+    /// The same, for the repeat of a run that came out dropped: it waits as long as `PATIENCE`.
+    pub fn finish_patiently(&mut self, input: &mut Input, asked: u64) -> Check {
+        let check = Check::judge(asked, input.wait_status_replies(asked, self.patience));
         input.take_status_replies();
-        Check::judge(asked, answered)
+        check
+    }
+
+    /// For a run that came out dropped: waits on, up to `PATIENCE`, for the answers still missing. Some
+    /// terminals answer more than the first wait allows. `Some` when they all came: the numbers are
+    /// real, the check is not clean (`Why::Retried`), and the run need not be repeated.
+    pub fn late_answers(&mut self, input: &mut Input, asked: u64) -> Option<Check> {
+        let answered = input.wait_status_replies(asked, self.patience);
+        input.take_status_replies();
+        (answered >= asked).then_some(Check::Unchecked(Why::Retried))
     }
 }
 
+/// The verdict on a run that was repeated because the first try was dropped: dropped again stays
+/// dropped; verified now is *unverified*, not verified, because the first try lost answers and the
+/// terminal can't be told from one that is slow or uneven (the numbers are the repeat's).
+pub fn after_retry(second: Check) -> Check {
+    match second {
+        Check::Verified { .. } => Check::Unchecked(Why::Retried),
+        other => other,
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod fake;
 #[cfg(test)]
 mod tests;

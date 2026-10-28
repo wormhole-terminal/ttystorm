@@ -51,6 +51,18 @@ pub struct Runner<'a, W: Write> {
     pub verifier: Verifier,
 }
 
+/// A timed run and what was found out about it.
+struct Attempt {
+    timed: Timed,
+    before: Option<procinfo::Sample>,
+    after: Option<procinfo::Sample>,
+    check: Option<Check>,
+    /// The queries the run wrote.
+    asked: u64,
+    /// Planned queries that no write carried.
+    unwritten: u64,
+}
+
 pub enum Step {
     Done(Box<TestResult>),
     /// A key asked to stop.
@@ -101,32 +113,37 @@ impl<W: Write> Runner<'_, W> {
         let mut rates = Vec::new();
         let mut times = Vec::new();
         let mut runs = Vec::new();
+        let mut unwritten = 0;
         for run in 0..self.runs {
             if self.interrupted() {
                 return Ok(Step::Interrupted);
             }
-            if !self.reset()? {
-                return Ok(Step::Done(Box::new(timeout_result(name, &main))));
-            }
-            // Planned before the clock starts: finding the places takes a pass over the payload.
-            let plan = self.verifier.plan(&main, unchecked.is_none());
-            self.verifier.begin(self.input);
-            let before = self.process.as_ref().and_then(|p| procinfo::sample(p.pid));
-            let Some(timed) = time_payload(self.input, &mut self.out, &main, &plan, RUN_TIMEOUT)? else {
+            let Some(mut got) = self.attempt(&main, unchecked.is_none(), false)? else {
                 return Ok(Step::Done(Box::new(timeout_result(name, &main))));
             };
-            let after = self.process.as_ref().and_then(|p| procinfo::sample(p.pid));
-            // After the clock stopped: waiting for stragglers here costs the measurement nothing.
-            if unchecked.is_none() {
-                // What was really written, not what was planned: the terminal is judged on the former.
-                let asked = timed.writes.iter().map(|w| u64::from(w.checkpoints)).sum();
-                debug_assert_eq!(asked, plan.len() as u64, "a planned checkpoint was never written");
-                let check = self.verifier.finish(self.input, asked);
-                if check.is_dropped() {
-                    return Ok(Step::Done(Box::new(dropped_result(name, &main, check))));
+            // "Dropped input" is an accusation: before it is made, wait longer for the answers still
+            // on their way, and if some are really missing, measure the run again, patiently, once.
+            if got.check.as_ref().is_some_and(Check::is_dropped) {
+                self.status(&format!("{head}  answers missing, looking again"))?;
+                match self.verifier.late_answers(self.input, got.asked) {
+                    Some(check) => got.check = Some(check),
+                    None => {
+                        let Some(mut again) = self.attempt(&main, true, true)? else {
+                            return Ok(Step::Done(Box::new(timeout_result(name, &main))));
+                        };
+                        again.check = again.check.map(integrity::after_retry);
+                        if let Some(check) = &again.check
+                            && check.is_dropped()
+                        {
+                            return Ok(Step::Done(Box::new(dropped_result(name, &main, check.clone()))));
+                        }
+                        got = again;
+                    }
                 }
-                checks.push(check);
             }
+            unwritten += got.unwritten;
+            checks.extend(got.check);
+            let (timed, before, after) = (got.timed, got.before, got.after);
             if let Some(trace) = &mut self.trace {
                 diag::write_trace(trace, name, run + 1, &timed)?;
             }
@@ -150,8 +167,40 @@ impl<W: Write> Runner<'_, W> {
             let distance = main.bytes.len() as f64 * checks.len() as f64 / (*checkpoints).max(1) as f64;
             result.extra.push(("checkpoint_distance".to_string(), distance.round()));
         }
+        if unwritten > 0 {
+            result.extra.push(("checkpoints_unwritten".to_string(), unwritten as f64));
+        }
         result.check = check;
         Ok(Step::Done(Box::new(result)))
+    }
+
+    /// One timed run of `main` from a reset screen, and (when `verify`) the verdict on its checkpoints.
+    /// `None` when it timed out. `patient` gives the answers longer to arrive, for a repeat.
+    fn attempt(&mut self, main: &Payload, verify: bool, patient: bool) -> io::Result<Option<Attempt>> {
+        if !self.reset()? {
+            return Ok(None);
+        }
+        // Planned before the clock starts: finding the places takes a pass over the payload.
+        let plan = self.verifier.plan(main, verify);
+        self.verifier.begin(self.input);
+        let before = self.process.as_ref().and_then(|p| procinfo::sample(p.pid));
+        let Some(timed) = time_payload(self.input, &mut self.out, main, &plan, RUN_TIMEOUT)? else {
+            return Ok(None);
+        };
+        let after = self.process.as_ref().and_then(|p| procinfo::sample(p.pid));
+        // After the clock stopped: waiting for stragglers here costs the measurement nothing.
+        // The terminal is judged on the queries really written, not the ones planned; a planned one that
+        // no write carried is counted and reported, not held against it.
+        let asked: u64 = timed.writes.iter().map(|w| u64::from(w.checkpoints)).sum();
+        let unwritten = (plan.len() as u64).saturating_sub(asked);
+        let check = verify.then(|| {
+            if patient {
+                self.verifier.finish_patiently(self.input, asked)
+            } else {
+                self.verifier.finish(self.input, asked)
+            }
+        });
+        Ok(Some(Attempt { timed, before, after, check, asked, unwritten }))
     }
 
     fn latency(&mut self, head: &str) -> io::Result<Step> {
@@ -358,6 +407,54 @@ fn latency_result(micros: &[f64]) -> TestResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bench::integrity::Why;
+    use crate::bench::integrity::fake::{Fake, Mode};
+
+    /// A throughput test of 300 KB against a stand-in terminal, as `bench` runs it.
+    fn bench_once(mode: Mode) -> TestResult {
+        let (mut input, term) = Fake::new(mode, 0..0);
+        let mut runner = Runner {
+            input: &mut input,
+            out: term,
+            size: Size { cols: 100, rows: 30, px_w: 0, px_h: 0 },
+            bytes: 300_000,
+            runs: 1,
+            plain: true,
+            process: None,
+            trace: None,
+            verifier: Verifier::for_test(PLAN_EVERY),
+        };
+        match runner.run_test("logflood", 0, 1).expect("run") {
+            Step::Done(r) => *r,
+            Step::Interrupted => panic!("interrupted"),
+        }
+    }
+
+    const PLAN_EVERY: usize = 64 * 1024;
+
+    #[test]
+    fn a_faithful_terminal_gets_a_verified_number() {
+        let r = bench_once(Mode::Faithful);
+        assert!(matches!(r.check, Some(Check::Verified { .. })), "{:?}", r.check);
+        assert!(r.median > 0.0);
+        assert!(r.extra("checkpoint_distance").is_some_and(|d| d > 0.0));
+    }
+
+    #[test]
+    fn a_terminal_that_keeps_dropping_input_is_reported_dropped_after_a_second_look() {
+        let r = bench_once(Mode::TailOfEachCall { keep: 4096 });
+        assert!(matches!(r.check, Some(Check::Dropped { .. })), "{:?}", r.check);
+        assert_eq!((r.median, r.unusable()), (0.0, Some("dropped input")));
+    }
+
+    #[test]
+    fn a_terminal_with_one_bad_moment_is_not_accused() {
+        // The warm-up takes big writes 0..4, the first try 4..9: those lose input, the repeat does not.
+        let r = bench_once(Mode::BadMoment { from: 4, to: 9 });
+        assert_eq!(r.check, Some(Check::Unchecked(Why::Retried)));
+        assert!(r.median > 0.0 && r.unusable().is_none());
+        assert!(r.unverified());
+    }
 
     #[test]
     fn latency_reports_percentiles_of_the_samples() {

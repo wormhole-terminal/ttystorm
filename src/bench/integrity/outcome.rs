@@ -28,6 +28,8 @@ pub enum Why {
     Surplus { answered: u64, checkpoints: u64 },
     /// All the checkpoints there were were answered, but there were fewer than [`ENOUGH`].
     TooFew { checkpoints: u64 },
+    /// Answers were missing at first and all came when ttystorm waited longer or repeated the run.
+    Retried,
     /// A result file from a newer ttystorm says something this one does not know.
     Unknown,
 }
@@ -98,6 +100,7 @@ impl Check {
                     Why::Lossy { answered } => ("lossy", *answered, BURST),
                     Why::Surplus { answered, checkpoints } => ("surplus", *answered, *checkpoints),
                     Why::TooFew { checkpoints } => ("few", *checkpoints, *checkpoints),
+                    Why::Retried => ("retried", 0, 0),
                     Why::Unknown => ("unknown", 0, 0),
                 };
                 format!(
@@ -128,6 +131,7 @@ impl Check {
                 Some("lossy") => Check::Unchecked(Why::Lossy { answered }),
                 Some("surplus") => Check::Unchecked(Why::Surplus { answered, checkpoints }),
                 Some("few") => Check::Unchecked(Why::TooFew { checkpoints }),
+                Some("retried") => Check::Unchecked(Why::Retried),
                 _ => unknown,
             },
             _ => unknown,
@@ -150,6 +154,7 @@ impl Why {
             Why::TooFew { checkpoints } => format!(
                 "the workload has room for only {checkpoints} checkpoints (it takes {ENOUGH}) and all were answered"
             ),
+            Why::Retried => "answers were missing for 3 s; they all came when ttystorm waited longer or repeated the run, so the terminal answers slowly or unevenly".to_string(),
             Why::Unknown => {
                 "the result file says something this version of ttystorm does not know".to_string()
             }
@@ -182,7 +187,10 @@ pub fn summary(checks: &[(&str, &Check)]) -> Option<(Level, String)> {
         let all = if names.len() == checks.len() { "all tests" } else { &names.join(", ") };
         return Some((
             Level::Warn,
-            format!("Not verified ({all}): {}. Unverified numbers do not rank in `compare`.", why.sentence()),
+            format!(
+                "Not verified ({all}): {}. Unverified numbers rank only among themselves in `compare`.",
+                why.sentence()
+            ),
         ));
     }
     let total: u64 = checks
@@ -243,6 +251,7 @@ mod tests {
             Check::Unchecked(Why::Lossy { answered: 5 }),
             Check::Unchecked(Why::Surplus { answered: 50, checkpoints: 48 }),
             Check::Unchecked(Why::TooFew { checkpoints: 9 }),
+            Check::Unchecked(Why::Retried),
             Check::Unchecked(Why::Unknown),
         ] {
             let v = json::parse(&c.to_json()).expect("json");

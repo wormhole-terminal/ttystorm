@@ -138,7 +138,7 @@ left out of the overall ratio), and in the `--save` file (`check.status` is `dro
   checkpoint bytes are not in it.
 - *Where.* Checkpoints are about 256 KiB apart (`--verify-every <KiB>`, 4 to 65536): each gap is drawn
   from the clock for each run between half and one and a half times that, and the checkpoint goes at the
-  first place past it where a query may go. A payload shorter than 8 MB gets them closer, a 32nd of its
+  first place past it where a query may go. A payload shorter than 8 MiB gets them closer, a 32nd of its
   length apart. A query goes at any such place in a write, not at the end of one: a terminal that parses
   only the end of each read or each tick would otherwise see them all, and the positions change from
   run to run so that no tick lines up with them. A query may go where no sequence or character is open
@@ -164,7 +164,7 @@ left out of the overall ratio), and in the `--save` file (`check.status` is `dro
   checkpoint, up to about a gap and a half, is covered only in the sense below.
 - *How the answers are counted.* Each `ESC [ 0 n` is taken out of what the terminal sends and counted,
   wherever it comes: before the cursor report, split across two reads, or long after (a terminal that
-  answers from another thread gets 3 s after the cursor report for stragglers; that wait is after the
+  answers from another thread gets 3 s after the cursor report for stragglers, and more before it is called dropped, see below; that wait is after the
   clock stopped, and only when an answer is missing). Nothing else in the stream is touched, so the
   cursor report and the DA1 sentinel are read as before. The count is compared with the number of
   queries actually written, not the number planned. Answers are identical, so they are counted, not
@@ -175,12 +175,23 @@ left out of the overall ratio), and in the `--save` file (`check.status` is `dro
   *unverified* ("not verified: the terminal does not answer DSR 5"), not failed (a terminal that says nothing at all costs 5 s, once). Some, or more than 16: it
   can't be counted on, also *unverified*. So a terminal is never marked as dropping input because it
   cannot answer.
-- *Unverified numbers do not compete.* They are shown with a † (screen, `--plain`, markdown, `compare`)
-  and the line under the header names the tests, but in `compare` they get no bar, never count as the
-  best, have no ratio and are left out of the overall ratio, so switching the check off (`--no-verify`)
-  gains nothing. A result file whose `check` this version cannot read counts as unverified too. Files from
-  before the check have no `check` and rank as they always did; `compare` says so when it mixes them with
-  checked ones.
+- *Before "dropped input" is said.* It is an accusation, so a run that missed answers is looked at
+  again, outside the clock. First ttystorm waits on, up to 10 s in all, for the answers still missing
+  (a terminal may answer more slowly than the 3 s allowed at first). If they all come, the numbers stand
+  but are *unverified* ("answers were missing for 3 s ..."), not verified: the terminal answers slowly or
+  unevenly. If some are still missing, the run is measured once more, with 10 s of patience; dropped again
+  is reported as dropped (with that second run's counts), and a second run that verifies is *unverified*
+  for the same reason, with the second run's numbers. A terminal that limits its answers under load can
+  therefore be told from one that loses input only if it recovers; one that does not is called dropped.
+- *Unverified numbers rank among themselves.* An unverified number is shown with a † (on the screen, in
+  markdown and in `compare`; `--plain` writes "(unverified)" on its line) and the line under the header names
+  the tests. In `compare` an unverified number never outranks a verified one and gets no ratio against
+  one (either way). In a row where nobody is verified they rank among themselves, with their †, so two
+  `--no-verify` files compare as they would have. The overall ratio is worked out within one kind: the
+  verified numbers when there are any (latency, which sends no payload, counts with either kind),
+  otherwise the unverified ones, with a †. So switching the check off gains nothing against a terminal that
+  was checked. A result file whose `check` this version cannot read counts as unverified too, and so does
+  a file from before the check (no `check`), which `compare` marks the same way.
 
 **What it proves.** A checkpoint that was answered was in the stream, reached the terminal's parser in its
 place, and was recognised. A stretch of lost input longer than a gap (the longest is 384 KiB at the default
@@ -209,9 +220,9 @@ do.)
 - *Short losses between checkpoints* may go unnoticed (the probabilities above). A terminal that drops a
   tenth of a percent of its input is not reliably caught; `--verify-every 4` makes the check denser, at
   the cost below.
-- *A terminal that answers late or not at all under load* (it holds answers longer than 3 s after the cursor
-  report, rate-limits them, or merges them) looks like one that dropped input; the idle burst test
-  catches the first kind of coalescing, not a limit that only bites under load. `dropped input` with most
+- *A terminal that answers late or not at all under load* (it holds answers for more than 10 s, rate-limits
+  them, or merges them) still looks like one that dropped input, if it behaves so twice in a row; the idle burst test
+  catches one kind of coalescing, not a limit that only bites under load. `dropped input` with most
   checkpoints answered is worth a second look with `--details`.
 - *tmux, screen, ssh and the like* answer queries themselves: through them the check, like the
   timing, describes the multiplexer.
@@ -231,15 +242,18 @@ do.)
   on another core), and after the last write the main thread works through the answers that are queued
   (strips and counts them, about a microsecond each) before it reaches the cursor report. Together well
   under a tenth of a millisecond; again an estimate.
-- To see what it costs with a particular terminal, run `logflood --no-verify` against `logflood` a few
-  times (the first says "unverified"); `--details` says how many checkpoints a run had and how far apart.
+- To see what it costs with a particular terminal, run `logflood --no-verify --plain` and `logflood --plain`
+  a few times each and read the two numbers (the first says "unverified"; `compare` sets verified and
+  unverified numbers side by side but never against each other). Two `--no-verify` files, or two
+  verified ones, do compare. `--details` says how many checkpoints a run had and how far apart.
 - The wait for stragglers happens after the clock has stopped, and only when an answer is missing.
 
 Files: `check_every_bytes` at the top level of a `--save` file is the distance asked for (`null` with
 `--no-verify`); per test `check` is `{"status": "verified"|"dropped"|"unchecked", "checkpoints": n,
-"answered": n}`, and for `unchecked` a `reason` (`off`, `silent`, `lossy`, `surplus`, `few`, `unknown`), and
+"answered": n}`, and for `unchecked` a `reason` (`off`, `silent`, `lossy`, `surplus`, `few`, `retried`, `unknown`), and
 `extra.checkpoint_distance` is the average distance the checkpoints really had in a verified test (bytes
-per checkpoint). A test with `status: dropped` has `median: 0`. `check` is `null` for `roundtrip` and for
+per checkpoint), and `extra.checkpoints_unwritten` appears if a planned checkpoint was never carried by a write
+(it is not held against the terminal). A test with `status: dropped` has `median: 0`. `check` is `null` for `roundtrip` and for
 files from before the check.
 
 ### Why a terminal is fast or slow

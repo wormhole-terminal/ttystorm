@@ -86,22 +86,31 @@ impl TestResult {
         self.extra.iter().find(|(k, _)| k == key).map(|(_, v)| *v)
     }
 
-    /// The input check could not vouch for this number (it was off, the terminal can't answer, the
-    /// workload has too few places for a checkpoint, ...).
-    pub fn unverified(&self) -> bool {
-        matches!(self.check, Some(Check::Unchecked(_)))
+    /// Whether the test sends a payload to be checked (`roundtrip` sends only questions).
+    pub fn has_payload(&self) -> bool {
+        self.unit != Unit::Micros
     }
 
-    /// Whether this result may be ranked against others: a number, from a terminal that was seen to take
-    /// the input in. A terminal that opts out of the check (`--no-verify`) shows its number but does not
-    /// compete with it. Results from before the check (`check` is `None`) rank as they always did.
-    pub fn ranks(&self) -> bool {
-        self.unusable().is_none() && !self.unverified() && self.median > 0.0
+    /// Whether the input check vouched for this number. `roundtrip` sends no payload, so there is
+    /// nothing to vouch for; every other test is verified only when its check says so. A result the
+    /// check could not decide for (it was off, the terminal can't answer, too few checkpoints), and one
+    /// from a file saved before the check existed, is not.
+    pub fn verified(&self) -> bool {
+        !self.has_payload() || matches!(self.check, Some(Check::Verified { .. }))
+    }
+
+    /// The opposite of [`verified`](Self::verified), for a number that has one: shown with a dagger,
+    /// and ranked only among results of the same kind.
+    pub fn unverified(&self) -> bool {
+        self.unusable().is_none() && !self.verified()
     }
 
     /// How many times better this is than `base` (above 1 is better, whichever way the unit goes).
+    /// Only a number of the same kind can be compared: a verified one is never set against an unverified
+    /// one, in either direction.
     pub fn better_than(&self, base: &TestResult) -> Option<f64> {
-        if !self.ranks() || !base.ranks() {
+        let usable = |t: &TestResult| t.unusable().is_none() && t.median > 0.0;
+        if !usable(self) || !usable(base) || self.verified() != base.verified() {
             return None;
         }
         Some(if self.unit.higher_is_better() { self.median / base.median } else { base.median / self.median })
@@ -260,7 +269,7 @@ pub fn sample(label: &str, scale: f64) -> Results {
         timeout: false,
         extra: vec![("p99".to_string(), v * 2.0)],
         diag: None,
-        check: None,
+        check: (unit != Unit::Micros).then_some(Check::Verified { checkpoints: 60 }),
     };
     Results {
         label: label.to_string(),

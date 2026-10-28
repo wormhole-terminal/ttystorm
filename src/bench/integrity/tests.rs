@@ -1,192 +1,12 @@
 //! The whole check against stand-ins for terminals: one that keeps its word, ones that don't, and one
 //! that shows what the check cannot see.
 
-use std::io;
 use std::ops::Range;
-use std::sync::mpsc::{self, Sender};
 use std::time::Duration;
 
-use super::plan::QUERY;
+use super::fake::{Fake, Mode, text};
 use super::*;
 use crate::bench::runner::time_payload;
-
-/// What a terminal that is all right answers to DSR 5.
-const REPLY: &[u8] = b"\x1b[0n";
-const CPR_QUERY: &[u8] = b"\x1b[6n";
-const DA1_QUERY: &[u8] = b"\x1b[c";
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Mode {
-    /// Answers everything, at once.
-    Faithful,
-    /// Never answers DSR 5 (answers the rest).
-    NoDsr5,
-    /// Answers only the first `n` DSR 5 queries it is ever sent.
-    Rationed(u64),
-    /// Answers every DSR 5 twice.
-    Twice,
-    /// Holds its DSR 5 answers back until after the next cursor report.
-    Late,
-    /// Throws away all input except the queries, and answers those: what a terminal written to pass
-    /// would do. The check cannot tell it from a faithful one.
-    PicksQueriesOut,
-    /// Parses only the last `keep` bytes of every call to `write` or `writev`: it reads in the
-    /// writer's units and keeps the end of each.
-    TailOfEachCall { keep: usize },
-    /// Reads in ticks of `tick` bytes of the stream and parses only the last `keep` of each: a ring
-    /// overwritten between ticks, whose ticks have nothing to do with the writer's writes.
-    TailOfEachTick { tick: usize, keep: usize },
-}
-
-/// A terminal that is a function of the bytes written to it. Bytes at offsets in `lost` never reach
-/// its parser, as if a ring buffer had been overwritten.
-struct Fake {
-    tx: Sender<Vec<u8>>,
-    mode: Mode,
-    lost: Range<usize>,
-    offset: usize,
-    window: Vec<u8>,
-    held: Vec<u8>,
-    /// What its parser got.
-    parsed: Vec<u8>,
-    /// How many bytes it was sent and how many reached its parser.
-    sent: usize,
-    kept: usize,
-    dsr5_seen: u64,
-    /// Calls to the kernel: `write` and `writev` count alike.
-    calls: usize,
-}
-
-impl Fake {
-    fn new(mode: Mode, lost: Range<usize>) -> (Input, Fake) {
-        let (tx, rx) = mpsc::channel();
-        let fake = Fake {
-            tx,
-            mode,
-            lost,
-            offset: 0,
-            window: Vec::new(),
-            held: Vec::new(),
-            parsed: Vec::new(),
-            sent: 0,
-            kept: 0,
-            dsr5_seen: 0,
-            calls: 0,
-        };
-        (Input::with_receiver(rx), fake)
-    }
-
-    fn send(&self, bytes: &[u8]) {
-        let _ = self.tx.send(bytes.to_vec());
-    }
-
-    fn answer_dsr5(&mut self) {
-        self.dsr5_seen += 1;
-        let copies = match self.mode {
-            Mode::NoDsr5 => 0,
-            Mode::Rationed(n) if self.dsr5_seen > n => 0,
-            Mode::Twice => 2,
-            _ => 1,
-        };
-        for _ in 0..copies {
-            if self.mode == Mode::Late {
-                self.held.extend_from_slice(REPLY);
-            } else {
-                self.send(REPLY);
-            }
-        }
-    }
-
-    /// Sends what was held back.
-    fn release(&mut self) {
-        let held = std::mem::take(&mut self.held);
-        if !held.is_empty() {
-            self.send(&held);
-        }
-    }
-
-    /// Whether the byte at `at` in this call (of `len` bytes) reaches the parser.
-    fn reaches_parser(&self, at: usize, len: usize) -> bool {
-        let offset = self.offset + at;
-        if self.lost.contains(&offset) {
-            return false;
-        }
-        match self.mode {
-            Mode::TailOfEachCall { keep } => at + keep >= len,
-            Mode::TailOfEachTick { tick, keep } => offset % tick + keep >= tick,
-            _ => true,
-        }
-    }
-
-    /// One call to the kernel with these bytes.
-    fn take(&mut self, buf: &[u8]) {
-        self.calls += 1;
-        // The question that follows the payload is the newest thing it was sent: a terminal that
-        // keeps the end of what it reads keeps that.
-        let newest = buf == CPR_QUERY;
-        self.sent += buf.len();
-        for (at, &b) in buf.iter().enumerate() {
-            if newest || self.reaches_parser(at, buf.len()) {
-                self.window.push(b);
-                self.kept += 1;
-            }
-        }
-        self.offset += buf.len();
-        let mut i = 0;
-        while i < self.window.len() {
-            let rest = &self.window[i..];
-            if rest.starts_with(QUERY) {
-                self.answer_dsr5();
-                i += QUERY.len();
-            } else if rest.starts_with(CPR_QUERY) {
-                self.send(b"\x1b[24;80R");
-                self.release();
-                i += CPR_QUERY.len();
-            } else if rest.starts_with(DA1_QUERY) {
-                self.send(b"\x1b[?62c");
-                self.release();
-                i += DA1_QUERY.len();
-            } else {
-                // A byte nothing is waiting on, unless it begins a query that isn't all here yet.
-                let pending =
-                    [QUERY, CPR_QUERY, DA1_QUERY].iter().any(|q| q.starts_with(rest) && rest.len() < q.len());
-                if pending {
-                    break;
-                }
-                if self.mode != Mode::PicksQueriesOut {
-                    self.parsed.push(self.window[i]);
-                }
-                i += 1;
-            }
-        }
-        self.window.drain(..i);
-    }
-}
-
-impl io::Write for Fake {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.take(buf);
-        Ok(buf.len())
-    }
-
-    /// Like the kernel's `writev`: everything in one call, in order.
-    fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
-        let all: Vec<u8> = bufs.iter().flat_map(|b| b.iter().copied()).collect();
-        self.take(&all);
-        Ok(all.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-fn text(len: usize) -> Payload {
-    Payload {
-        bytes: b"2026-10-28 INFO request id=42\r\n".iter().copied().cycle().take(len).collect(),
-        ..Payload::default()
-    }
-}
 
 /// One measured run as `bench` makes it: probe, plan, time, count.
 fn run(mode: Mode, lost: Range<usize>, payload: &Payload) -> (Option<Why>, Option<Check>, Fake) {
@@ -367,4 +187,47 @@ fn the_check_can_be_turned_off() {
     assert_eq!(v.unchecked(&mut input, &mut term).expect("probe"), Some(Why::Off));
     assert_eq!(v.plan(&text(1_000_000), false), Plan::none());
     assert_eq!(term.dsr5_seen, 0);
+}
+
+#[test]
+fn answers_that_are_late_but_all_come_are_not_called_dropped() {
+    let p = text(1_000_000);
+    let (mut input, mut term) = Fake::new(Mode::Faithful, 0..0);
+    let mut v = Verifier::for_test(64 * 1024);
+    assert_eq!(v.unchecked(&mut input, &mut term).expect("probe"), None);
+    term.mode = Mode::Delayed { ms: 200 };
+    let plan = v.plan(&p, true);
+    v.begin(&mut input);
+    let timed = time_payload(&mut input, &mut term, &p, &plan, Duration::from_secs(10)).expect("run");
+    let asked: u64 = timed.expect("answered").writes.iter().map(|w| u64::from(w.checkpoints)).sum();
+    // The first look (60 ms in the test) sees answers missing ...
+    let first = v.finish(&mut input, asked);
+    assert!(first.is_dropped(), "{first:?}");
+    // ... the longer wait gets them all, and the verdict is "unverified", not "verified" and not "dropped".
+    assert_eq!(v.late_answers(&mut input, asked), Some(Check::Unchecked(Why::Retried)));
+}
+
+#[test]
+fn answers_that_never_come_stay_missing_after_the_longer_wait() {
+    let p = text(1_000_000);
+    let (mut input, mut term) = Fake::new(Mode::TailOfEachCall { keep: 4096 }, 0..0);
+    let mut v = Verifier::for_test(64 * 1024);
+    // The probe's burst fits in the tail it keeps.
+    assert_eq!(v.unchecked(&mut input, &mut term).expect("probe"), None);
+    let plan = v.plan(&p, true);
+    v.begin(&mut input);
+    let timed = time_payload(&mut input, &mut term, &p, &plan, Duration::from_secs(10)).expect("run");
+    let asked: u64 = timed.expect("answered").writes.iter().map(|w| u64::from(w.checkpoints)).sum();
+    assert!(v.finish(&mut input, asked).is_dropped());
+    assert_eq!(v.late_answers(&mut input, asked), None);
+}
+
+#[test]
+fn a_repeat_that_verifies_is_unverified_and_one_that_drops_again_is_dropped() {
+    let ok = Check::Verified { checkpoints: 30 };
+    assert_eq!(after_retry(ok), Check::Unchecked(Why::Retried));
+    let dropped = Check::Dropped { answered: 3, checkpoints: 30 };
+    assert_eq!(after_retry(dropped.clone()), dropped);
+    let few = Check::Unchecked(Why::TooFew { checkpoints: 9 });
+    assert_eq!(after_retry(few.clone()), few);
 }

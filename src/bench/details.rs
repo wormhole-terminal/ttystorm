@@ -129,7 +129,7 @@ fn check_lines(t: &TestResult, r: &Results) -> Vec<String> {
         (None, Some(n)) => format!(", asked for one per {} KiB", n / 1024),
         (None, None) => String::new(),
     };
-    match check {
+    let mut lines = match check {
         Check::Verified { checkpoints } => vec![
             format!(
                 "input check: verified, {checkpoints} checkpoints in {} runs{every}, all answered",
@@ -149,7 +149,13 @@ fn check_lines(t: &TestResult, r: &Results) -> Vec<String> {
                 .to_string(),
         ],
         Check::Unchecked(why) => vec![format!("input check: not verified, {}", why.sentence())],
+    };
+    if let Some(n) = t.extra("checkpoints_unwritten") {
+        lines.push(format!(
+            "  note: {n:.0} planned checkpoints were never written and are not held against the terminal"
+        ));
     }
+    lines
 }
 
 fn test_section(t: &TestResult, r: &Results) -> Option<String> {
@@ -277,6 +283,14 @@ mod tests {
         let mut r = with_diag();
         r.process = None;
         assert!(details(&r).contains("not found"));
+    }
+
+    #[test]
+    fn unwritten_checkpoints_are_noted_not_held_against_the_terminal() {
+        let mut r = with_diag();
+        r.tests[0].check = Some(Check::Verified { checkpoints: 48 });
+        r.tests[0].extra.push(("checkpoints_unwritten".to_string(), 2.0));
+        assert!(details(&r).contains("2 planned checkpoints were never written"));
     }
 
     #[test]
