@@ -116,6 +116,14 @@ fn leading_kind_unverified(scores: &[Option<Score>]) -> bool {
     !scores.iter().flatten().any(|s| !s.unverified)
 }
 
+/// The best score of the competing kind, `0.0` when there is no race: with a single score (the first
+/// file's own, always 1) nobody leads.
+fn top_score(scores: &[Option<Score>], unverified: bool) -> f64 {
+    let racing: Vec<f64> =
+        scores.iter().flatten().filter(|s| s.unverified == unverified).map(|s| s.value).collect();
+    if racing.len() < 2 { 0.0 } else { racing.into_iter().fold(0.0f64, f64::max) }
+}
+
 fn ratio_color(x: f64) -> super::super::canvas::Rgb {
     if x >= 1.05 {
         GOOD
@@ -261,8 +269,7 @@ pub fn compare_markdown(all: &[Results]) -> String {
     let scores: Vec<Option<Score>> = all.iter().map(|r| overall(r, &all[0])).collect();
     let of = test_names(all).len();
     let kind = leading_kind_unverified(&scores);
-    let top =
-        scores.iter().flatten().filter(|s| s.unverified == kind).map(|s| s.value).fold(0.0f64, f64::max);
+    let top = top_score(&scores, kind);
     let cells: Vec<String> = scores
         .iter()
         .map(|sc| {
@@ -384,7 +391,7 @@ pub fn compare_panel(all: &[Results], width: usize) -> Panel {
     // Only scores of the leading kind compete; a score of the other kind is shown, with its dagger.
     let kind = leading_kind_unverified(&scores);
     let counts = |s: &Score| s.unverified == kind;
-    let top = scores.iter().flatten().filter(|s| counts(s)).map(|s| s.value).fold(0.0f64, f64::max);
+    let top = top_score(&scores, kind);
     let wins: Vec<usize> = (0..all.len())
         .map(|i| test_names(all).iter().filter(|n| best_of(all, n) == Some(i)).count())
         .collect();
@@ -404,7 +411,8 @@ pub fn compare_panel(all: &[Results], width: usize) -> Panel {
             l.text(&name, DIM)
         };
         l.pad(1);
-        let frac = scores[i].filter(counts).map(|s| s.value / top.max(1e-9)).unwrap_or(0.0);
+        let frac = scores[i].filter(counts).map(|s| (s.value / top.max(1e-9)).min(1.0)).unwrap_or(0.0);
+        let frac = if top > 0.0 { frac } else { 0.0 };
         l.bar(frac, c.bar, if leader { 1.0 } else { 0.55 }).pad(2);
         let w = format!("{} {}", wins[i], if wins[i] == 1 { "win" } else { "wins" });
         l.right(&w, if leader { TEXT } else { DIM }, 2 + 2 + c.label + 1 + c.bar + 2 + VALUE_W);
@@ -645,6 +653,21 @@ mod tests {
         assert!(screen.contains("No overall ratio (—)"), "{screen}");
         // Two files of one kind need no note.
         assert!(!compare_markdown(&three()).contains("No overall ratio"));
+    }
+
+    #[test]
+    fn the_first_file_alone_with_an_overall_does_not_lead() {
+        let mut all = three();
+        unverify(&mut all[1]);
+        unverify(&mut all[2]);
+        let md = compare_markdown(&all);
+        let row = md.lines().last().unwrap_or_default();
+        assert!(row.contains("| ×1.00 |") && !row.contains("**"), "{row}");
+        let mut out = Vec::new();
+        compare_panel(&all, 100).write(&mut out);
+        let screen = String::from_utf8_lossy(&out);
+        let overall_part = screen.split("OVERALL").nth(1).unwrap_or_default();
+        assert!(overall_part.contains("Wormhole") && !overall_part.contains('▸'), "{overall_part}");
     }
 
     #[test]
