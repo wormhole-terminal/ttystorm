@@ -35,7 +35,14 @@ pub struct Input {
     /// count since the last `take_status_replies`); `None` when `sync` has not found one since, or
     /// the replies are not counted.
     before_report: Option<u64>,
+    /// Since when `keys` has been holding back the unfinished escape sequence at the end of `pending`.
+    held_since: Option<Instant>,
 }
+
+/// How long `keys` waits for the rest of an escape sequence that stops short, before it takes what is
+/// there for what it is. A reply arrives within microseconds of its first byte; a key that begins like
+/// one (Esc, Alt+]) should not hold the keys behind it for long.
+const HOLD: Duration = Duration::from_millis(100);
 
 impl Input {
     pub fn start() -> Self {
@@ -67,6 +74,7 @@ impl Input {
             counting: false,
             status_replies: 0,
             before_report: None,
+            held_since: None,
         }
     }
 
@@ -147,12 +155,20 @@ impl Input {
     }
 
     /// The keys pressed since the last call, never blocking. The start of an escape sequence whose
-    /// end hasn't arrived stays for the next call, so half a reply is not read as typing.
+    /// end hasn't arrived (also a lone `ESC`, which may be the first byte of a reply read in two parts)
+    /// stays for the next call, for no longer than `HOLD`: half a reply is not read as typing, and a
+    /// real Esc press still counts a moment later.
     pub fn keys(&mut self) -> Vec<Key> {
         while let Ok(chunk) = self.rx.try_recv() {
             self.take(chunk);
         }
-        let whole = partial_tail(&self.pending);
+        let whole = match unfinished_tail(&self.pending) {
+            Some(at) if self.held_since.get_or_insert_with(Instant::now).elapsed() < HOLD => at,
+            _ => {
+                self.held_since = None;
+                self.pending.len()
+            }
+        };
         let rest = self.pending.split_off(whole);
         let bytes = std::mem::replace(&mut self.pending, rest);
         parse_keys(&bytes)
@@ -163,6 +179,14 @@ impl Input {
     /// output has really been consumed. `None` on a timeout. When the status reports are counted,
     /// how many were read before the cursor report is kept (`status_replies_before_report`).
     pub fn sync(&mut self, out: &mut impl Write, timeout: Duration) -> io::Result<Option<Duration>> {
+        // A cursor report that is already here answers an earlier question (one that timed out): it must
+        // not stand in for the answer to this one.
+        while let Ok(chunk) = self.rx.try_recv() {
+            self.take(chunk);
+        }
+        while let Some(old) = parse_cpr(&self.pending) {
+            self.pending.drain(old.start..old.end);
+        }
         let start = Instant::now();
         out.write_all(b"\x1b[6n")?;
         out.flush()?;
@@ -284,13 +308,13 @@ impl Input {
     }
 }
 
-/// Where the unfinished escape sequence at the end of `bytes` starts, `bytes.len()` when there is
-/// none. A lone `ESC` is the Esc key, not the start of anything.
-fn partial_tail(bytes: &[u8]) -> usize {
-    match bytes.iter().rposition(|&b| b == 0x1b) {
-        Some(at) if bytes.len() - at > 1 && matches!(scan(&bytes[at..]), Scan::Partial) => at,
-        _ => bytes.len(),
-    }
+/// Where the escape sequence that may go on past the end of `bytes` starts: a lone `ESC`, or a
+/// sequence whose end hasn't arrived. `None` when there is none, or when a Ctrl-C follows it: that
+/// is a key whatever the sequence was.
+fn unfinished_tail(bytes: &[u8]) -> Option<usize> {
+    let at = bytes.iter().rposition(|&b| b == 0x1b)?;
+    let open = bytes.len() - at == 1 || matches!(scan(&bytes[at..]), Scan::Partial);
+    (open && !bytes[at..].contains(&0x03)).then_some(at)
 }
 
 fn parse_keys(bytes: &[u8]) -> Vec<Key> {
@@ -308,18 +332,19 @@ fn parse_keys(bytes: &[u8]) -> Vec<Key> {
                     _ => None,
                 };
                 keys.extend(key);
-                // Skip the whole sequence, whatever it was.
+                // Skip the whole sequence, whatever it was; a control character ends it, and is read.
                 let mut j = i + 2;
-                while j < bytes.len() && !(0x40..=0x7e).contains(&bytes[j]) {
+                while j < bytes.len() && !(0x40..=0x7e).contains(&bytes[j]) && bytes[j] >= 0x20 {
                     j += 1;
                 }
-                i = j;
+                i = if j < bytes.len() && bytes[j] < 0x20 { j - 1 } else { j };
             }
-            // A string reply (DCS, OSC, APC) is not typing; skip it whole.
+            // A string reply (DCS, OSC, APC) is not typing; skip it whole. One that never ended (Alt+]
+            // typed, not a reply) gives up its introducer and leaves what follows to be read.
             0x1b if matches!(bytes.get(i + 1), Some(b'P' | b']' | b'_' | b'^' | b'X')) => {
                 match scan(&bytes[i..]) {
                     Scan::Done(len, _) => i += len - 1,
-                    Scan::Partial => i = bytes.len(),
+                    Scan::Partial => {}
                     Scan::Not => keys.push(Key::Esc),
                 }
             }
@@ -343,29 +368,21 @@ mod tests {
 
     #[test]
     fn counting_leaves_the_cursor_report_for_sync_to_find() {
-        let (tx, rx) = mpsc::channel();
-        let mut input = Input::with_receiver(rx);
+        let (mut input, mut term) = fake(&[], vec![(0, b"\x1b[0n\x1b["), (5, b"0n\x1b[4;1R")]);
         input.count_status_replies();
-        let _ = tx.send(b"\x1b[0n\x1b[".to_vec());
-        let _ = tx.send(b"0n\x1b[4;1R".to_vec());
-        let mut sink = Vec::new();
-        assert!(input.sync(&mut sink, Duration::from_secs(2)).expect("sync").is_some());
+        assert!(input.sync(&mut term, Duration::from_secs(2)).expect("sync").is_some());
         assert_eq!(input.take_status_replies(), 2);
         assert_eq!(input.take_status_replies(), 0);
     }
 
     #[test]
     fn only_the_reports_in_front_of_the_cursor_report_are_before_it() {
-        let (tx, rx) = mpsc::channel();
-        let mut input = Input::with_receiver(rx);
-        input.count_status_replies();
         // Two in an earlier read, one in front of the cursor report and one behind it in its read, and
         // one that comes in a read of its own after it.
-        let _ = tx.send(b"\x1b[0n\x1b[0n".to_vec());
-        let _ = tx.send(b"\x1b[0n\x1b[4;1R\x1b[0n".to_vec());
-        let _ = tx.send(b"\x1b[0n".to_vec());
-        let mut sink = Vec::new();
-        assert!(input.sync(&mut sink, Duration::from_secs(2)).expect("sync").is_some());
+        let (mut input, mut term) =
+            fake(&[], vec![(0, b"\x1b[0n\x1b[0n"), (5, b"\x1b[0n\x1b[4;1R\x1b[0n"), (5, b"\x1b[0n")]);
+        input.count_status_replies();
+        assert!(input.sync(&mut term, Duration::from_secs(2)).expect("sync").is_some());
         assert_eq!(input.status_replies_before_report(), Some(3));
         assert_eq!(input.wait_status_replies(5, Duration::from_secs(2)), 5);
         // The next count starts again, and so does what is known about the report.
@@ -375,23 +392,16 @@ mod tests {
 
     #[test]
     fn a_report_split_by_the_read_boundary_is_before_the_cursor_report_that_follows() {
-        let (tx, rx) = mpsc::channel();
-        let mut input = Input::with_receiver(rx);
+        let (mut input, mut term) = fake(&[], vec![(0, b"\x1b["), (5, b"0n\x1b[4;1R")]);
         input.count_status_replies();
-        let _ = tx.send(b"\x1b[".to_vec());
-        let _ = tx.send(b"0n\x1b[4;1R".to_vec());
-        let mut sink = Vec::new();
-        assert!(input.sync(&mut sink, Duration::from_secs(2)).expect("sync").is_some());
+        assert!(input.sync(&mut term, Duration::from_secs(2)).expect("sync").is_some());
         assert_eq!(input.status_replies_before_report(), Some(1));
     }
 
     #[test]
     fn nothing_is_known_about_the_order_when_the_reports_are_not_counted() {
-        let (tx, rx) = mpsc::channel();
-        let mut input = Input::with_receiver(rx);
-        let _ = tx.send(b"\x1b[4;1R".to_vec());
-        let mut sink = Vec::new();
-        assert!(input.sync(&mut sink, Duration::from_secs(2)).expect("sync").is_some());
+        let (mut input, mut term) = fake(&[], vec![(0, b"\x1b[4;1R")]);
+        assert!(input.sync(&mut term, Duration::from_secs(2)).expect("sync").is_some());
         assert_eq!(input.status_replies_before_report(), None);
     }
 
@@ -403,14 +413,61 @@ mod tests {
         assert_eq!(input.keys(), vec![Key::Char('q')]);
         let _ = tx.send(b"4;4c".to_vec());
         assert_eq!(input.keys(), vec![]);
-        // A lone escape is the Esc key, and is not held back.
-        let _ = tx.send(b"\x1b".to_vec());
-        assert_eq!(input.keys(), vec![Key::Esc]);
-        // Nor is the start of a string reply lost when it comes in pieces.
+        // The start of a string reply is not lost when it comes in pieces.
         let _ = tx.send(b"\x1bP>|Te".to_vec());
         assert_eq!(input.keys(), vec![]);
         let _ = tx.send(b"rm\x1b\\x".to_vec());
         assert_eq!(input.keys(), vec![Key::Char('x')]);
+    }
+
+    #[test]
+    fn a_lone_escape_waits_a_moment_for_the_rest_of_a_reply_and_is_then_the_esc_key() {
+        let (tx, rx) = mpsc::channel();
+        let mut input = Input::with_receiver(rx);
+        input.count_status_replies();
+        // A status report read in two parts must not stop the benchmark.
+        let _ = tx.send(b"\x1b".to_vec());
+        assert_eq!(input.keys(), vec![]);
+        let _ = tx.send(b"[0n".to_vec());
+        assert_eq!(input.keys(), vec![]);
+        assert_eq!(input.take_status_replies(), 1);
+        // A real Esc press goes through once nothing more comes.
+        let _ = tx.send(b"\x1b".to_vec());
+        assert_eq!(input.keys(), vec![]);
+        thread::sleep(HOLD + Duration::from_millis(30));
+        assert_eq!(input.keys(), vec![Key::Esc]);
+        assert_eq!(input.keys(), vec![]);
+    }
+
+    #[test]
+    fn keys_behind_an_unfinished_sequence_that_never_ends_still_get_through() {
+        let (tx, rx) = mpsc::channel();
+        let mut input = Input::with_receiver(rx);
+        // Alt+] and Alt+Shift+P begin strings; neither is followed by a terminator.
+        for lead in [&b"\x1b]"[..], b"\x1bP", b"\x1b_"] {
+            let _ = tx.send(lead.to_vec());
+            assert_eq!(input.keys(), vec![], "held for a moment");
+            // Ctrl-C is a key at once.
+            let _ = tx.send(b"\x03".to_vec());
+            assert_eq!(input.keys(), vec![Key::Char(lead[1] as char), Key::CtrlC]);
+            // And so are the others, after the moment.
+            let _ = tx.send(b"q".to_vec());
+            thread::sleep(HOLD + Duration::from_millis(30));
+            assert_eq!(input.keys(), vec![Key::Char('q')]);
+        }
+        // Ctrl-C inside an unfinished CSI is read too.
+        let _ = tx.send(b"\x1b[1;\x03".to_vec());
+        assert_eq!(input.keys(), vec![Key::CtrlC]);
+    }
+
+    #[test]
+    fn a_cursor_report_that_was_already_here_does_not_answer_the_next_question() {
+        // The late answer to a question that timed out waits in the channel; the real one comes 60 ms
+        // after this question is asked.
+        let (mut input, mut term) = fake(&[b"\x1b[9;9R"], vec![(60, b"\x1b[3;4R")]);
+        let took = input.sync(&mut term, Duration::from_secs(2)).expect("sync").expect("answered");
+        assert!(took >= Duration::from_millis(50), "{took:?}");
+        assert!(input.pending.is_empty(), "{:?}", input.pending);
     }
 
     #[test]
