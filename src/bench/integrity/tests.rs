@@ -237,7 +237,8 @@ fn answers_that_are_late_but_all_come_are_not_called_dropped() {
     // ... and a patient look at a run whose answers all come, late, is neither dropped nor verified.
     let patience = v.patience();
     v.begin(&mut input);
-    let plan = v.plan(&p, true, SLOT);
+    // The repeat is the run's second try, as the runner plans it.
+    let plan = v.plan(&p, true, Slot { attempt: 1, ..SLOT });
     let timed = time_payload(&mut input, &mut term, &p, &plan, Duration::from_secs(10)).expect("run");
     let asked: u64 = timed.expect("answered").writes.iter().map(|w| u64::from(w.checkpoints)).sum();
     let again = v.finish(&mut input, asked, patience);

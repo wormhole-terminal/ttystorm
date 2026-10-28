@@ -1,6 +1,8 @@
 //! What the terminal sends us: keys, read on a thread of its own, and the questions we ask it.
 
 use std::io::{self, Read, Write};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -35,18 +37,24 @@ pub struct Input {
     /// count since the last `take_status_replies`); `None` when `sync` has not found one since, or
     /// the replies are not counted.
     before_report: Option<u64>,
-    /// Since when `keys` has been holding back the unfinished escape sequence at the end of `pending`.
-    held_since: Option<Instant>,
+    /// When the last bytes were read, in nanoseconds after `started`: stamped by the reader thread when
+    /// they come (so a key is aged from its arrival, not from the call that finds it), and by `stash` for
+    /// an input without a reader thread of its own.
+    last_read: Arc<AtomicU64>,
+    reader_stamps: bool,
 }
 
-/// How long `keys` waits for the rest of an escape sequence that stops short, before it takes what is
-/// there for what it is. A reply arrives within microseconds of its first byte; a key that begins like
-/// one (Esc, Alt+]) should not hold the keys behind it for long.
+/// How long `keys` waits, after the last byte read, for the rest of an escape sequence that stops
+/// short, before it takes what is there for what it is. A reply arrives within microseconds of its
+/// first byte; a key that begins like one (Esc, Alt+]) should not hold the keys behind it for long.
 const HOLD: Duration = Duration::from_millis(100);
 
 impl Input {
     pub fn start() -> Self {
         let (tx, rx) = mpsc::channel();
+        let started = Instant::now();
+        let last_read = Arc::new(AtomicU64::new(0));
+        let stamp = Arc::clone(&last_read);
         thread::spawn(move || {
             let mut stdin = io::stdin().lock();
             let mut buf = [0u8; 4096];
@@ -54,6 +62,7 @@ impl Input {
                 match stdin.read(&mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
+                        stamp.store(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
                         if tx.send(buf[..n].to_vec()).is_err() {
                             break;
                         }
@@ -61,20 +70,31 @@ impl Input {
                 }
             }
         });
-        Self::with_receiver(rx)
+        Self::build(rx, started, last_read, true)
     }
 
     /// An input fed from a channel instead of stdin: what the tests use.
+    #[cfg(test)]
     pub(crate) fn with_receiver(rx: Receiver<Vec<u8>>) -> Self {
+        Self::build(rx, Instant::now(), Arc::new(AtomicU64::new(0)), false)
+    }
+
+    fn build(
+        rx: Receiver<Vec<u8>>,
+        started: Instant,
+        last_read: Arc<AtomicU64>,
+        reader_stamps: bool,
+    ) -> Self {
         Self {
             rx,
             pending: Vec::new(),
-            started: Instant::now(),
+            started,
             tap: None,
             counting: false,
             status_replies: 0,
             before_report: None,
-            held_since: None,
+            last_read,
+            reader_stamps,
         }
     }
 
@@ -95,7 +115,15 @@ impl Input {
         if let Some(tap) = &mut self.tap {
             tap.push(format!("+{:.3} ms  {}", self.started.elapsed().as_secs_f64() * 1e3, escape(&chunk)));
         }
+        if !self.reader_stamps {
+            self.last_read.store(self.started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
         self.pending.extend_from_slice(&chunk);
+    }
+
+    /// How long ago bytes were last read.
+    fn quiet_for(&self) -> Duration {
+        self.started.elapsed().saturating_sub(Duration::from_nanos(self.last_read.load(Ordering::Relaxed)))
     }
 
     /// Takes the status reports out of what is pending and counts them (when counting).
@@ -162,12 +190,11 @@ impl Input {
         while let Ok(chunk) = self.rx.try_recv() {
             self.take(chunk);
         }
+        // Held while the input is still coming; aged from the last read, so nothing is left over to
+        // reset when `sync` or `ask` use `pending` up.
         let whole = match unfinished_tail(&self.pending) {
-            Some(at) if self.held_since.get_or_insert_with(Instant::now).elapsed() < HOLD => at,
-            _ => {
-                self.held_since = None;
-                self.pending.len()
-            }
+            Some(at) if self.quiet_for() < HOLD => at,
+            _ => self.pending.len(),
         };
         let rest = self.pending.split_off(whole);
         let bytes = std::mem::replace(&mut self.pending, rest);
@@ -439,6 +466,28 @@ mod tests {
         assert_eq!(input.keys(), vec![]);
     }
 
+    /// What the reviewer found: the hold was timed from the first look at the byte, so with one look per
+    /// run an Esc press took effect a run late.
+    #[test]
+    fn an_esc_is_aged_from_its_arrival_and_not_from_the_first_look() {
+        let (tx, rx) = mpsc::channel();
+        let started = Instant::now();
+        let stamp = Arc::new(AtomicU64::new(0));
+        let mut input = Input::build(rx, started, Arc::clone(&stamp), true);
+        // The reader thread stamps the read, then hands the bytes over.
+        let arrive = |bytes: &[u8]| {
+            stamp.store(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            let _ = tx.send(bytes.to_vec());
+        };
+        arrive(b"\x1b");
+        thread::sleep(HOLD + Duration::from_millis(30));
+        // The first look is long after it came: no more waiting.
+        assert_eq!(input.keys(), vec![Key::Esc]);
+        // One that has just come is still given its moment.
+        arrive(b"\x1b");
+        assert_eq!(input.keys(), vec![]);
+    }
+
     #[test]
     fn keys_behind_an_unfinished_sequence_that_never_ends_still_get_through() {
         let (tx, rx) = mpsc::channel();
@@ -467,6 +516,20 @@ mod tests {
         let (mut input, mut term) = fake(&[b"\x1b[9;9R"], vec![(60, b"\x1b[3;4R")]);
         let took = input.sync(&mut term, Duration::from_secs(2)).expect("sync").expect("answered");
         assert!(took >= Duration::from_millis(50), "{took:?}");
+        assert!(input.pending.is_empty(), "{:?}", input.pending);
+    }
+
+    #[test]
+    fn status_replies_already_queued_are_before_the_report_and_a_stale_report_does_not_answer() {
+        // Two status replies and the late report of a question that timed out are waiting when the next
+        // question is asked; its own report comes 60 ms later.
+        let (mut input, mut term) = fake(&[b"\x1b[0n\x1b[0n\x1b[9;9R"], vec![(60, b"\x1b[3;4R\x1b[0n")]);
+        input.count_status_replies();
+        let took = input.sync(&mut term, Duration::from_secs(2)).expect("sync").expect("answered");
+        assert!(took >= Duration::from_millis(50), "{took:?}");
+        assert_eq!(input.status_replies_before_report(), Some(2));
+        // The one behind the report in its read is counted, but not as before it.
+        assert_eq!(input.take_status_replies(), 3);
         assert!(input.pending.is_empty(), "{:?}", input.pending);
     }
 
