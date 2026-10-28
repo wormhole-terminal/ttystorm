@@ -62,24 +62,33 @@ fn ratio_text(x: f64) -> String {
     if x >= 100.0 { format!("×{x:.0}") } else { format!("×{x:.2}") }
 }
 
-/// An overall ratio, and whether it was worked out from unverified numbers.
+/// An overall ratio, and what it was worked out from.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Score {
     value: f64,
+    /// Worked out from unverified numbers.
     unverified: bool,
+    /// The number of tests in the mean.
+    tests: usize,
 }
 
 impl Score {
     fn text(self) -> String {
         format!("{}{}", ratio_text(self.value), if self.unverified { " †" } else { "" })
     }
+
+    /// "3 of 4 tests" when the mean leaves out tests of the table, `None` when it covers them all. A
+    /// terminal that timed out on the hard tests would otherwise lead on the easy ones without a word.
+    fn coverage(self, of: usize) -> Option<String> {
+        (self.tests < of).then(|| format!("{} of {of} tests", self.tests))
+    }
 }
 
 /// The geometric mean of how many times better `r` is than `base` over the tests both completed, among
 /// the verified numbers; when there are none, among the unverified ones, marked as such. The two kinds
-/// are never mixed in one mean.
+/// are never mixed in one mean. `None` when no test has a number of the same kind in both files: latency
+/// sends no payload and has no kind, but it alone is no ground for an overall ratio.
 fn overall(r: &Results, base: &Results) -> Option<Score> {
-    // `roundtrip` sends no payload, so it has no kind and counts in whichever mean is worked out.
     let (mut verified, mut unverified, mut neutral) = (Vec::new(), Vec::new(), Vec::new());
     for t in &r.tests {
         if let Some(x) = find(base, &t.name).and_then(|b| t.better_than(b)) {
@@ -95,14 +104,11 @@ fn overall(r: &Results, base: &Results) -> Option<Score> {
     let (mut ratios, unverified) = match (verified.is_empty(), unverified.is_empty()) {
         (false, _) => (verified, false),
         (true, false) => (unverified, true),
-        (true, true) => (Vec::new(), false),
+        (true, true) => return None,
     };
     ratios.extend(neutral);
-    if ratios.is_empty() {
-        return None;
-    }
     let value = (ratios.iter().map(|x| x.ln()).sum::<f64>() / ratios.len() as f64).exp();
-    Some(Score { value, unverified })
+    Some(Score { value, unverified, tests: ratios.len() })
 }
 
 /// Which scores compete: the verified ones, or when there are none, the unverified ones.
@@ -201,6 +207,12 @@ fn warnings(all: &[Results]) -> Vec<String> {
         warnings
             .push("Terminal sizes differ, which changes the scrolling, cursor and frame tests.".to_string());
     }
+    if all.iter().skip(1).any(|r| overall(r, base).is_none()) {
+        warnings.push(
+            "No overall ratio (—) for a file with no test whose number is of the same kind as the first file's: a verified number is never set against an unverified one."
+                .to_string(),
+        );
+    }
     if all.iter().flat_map(|r| &r.tests).any(TestResult::unverified) {
         warnings.push(
             "Numbers marked † are not verified (the input check was off, or could not decide, or the file was saved before the check existed). They rank only among themselves: never above a verified number, with no ratio against one, and the overall ratio is worked out within each kind."
@@ -247,17 +259,23 @@ pub fn compare_markdown(all: &[Results]) -> String {
         s.push_str(&format!("| {} | {} |\n", escape_cell(&name), cells.join(" | ")));
     }
     let scores: Vec<Option<Score>> = all.iter().map(|r| overall(r, &all[0])).collect();
+    let of = test_names(all).len();
     let kind = leading_kind_unverified(&scores);
     let top =
         scores.iter().flatten().filter(|s| s.unverified == kind).map(|s| s.value).fold(0.0f64, f64::max);
     let cells: Vec<String> = scores
         .iter()
-        .map(|sc| match sc {
-            Some(s) if s.unverified == kind && s.value >= top && top > 0.0 => {
+        .map(|sc| {
+            let Some(s) = sc else { return "—".to_string() };
+            let mut cell = if s.unverified == kind && s.value >= top && top > 0.0 {
                 format!("**{}**", ratio_text(s.value)) + if s.unverified { " †" } else { "" }
+            } else {
+                s.text()
+            };
+            if let Some(cover) = s.coverage(of) {
+                cell.push_str(&format!(" ({cover})"));
             }
-            Some(s) => s.text(),
-            None => "—".to_string(),
+            cell
         })
         .collect();
     s.push_str(&format!("| Overall vs {} | {} |\n", escape_cell(&all[0].label), cells.join(" | ")));
@@ -362,6 +380,7 @@ pub fn compare_panel(all: &[Results], width: usize) -> Panel {
     );
     p.push(l);
     let scores: Vec<Option<Score>> = all.iter().map(|r| overall(r, base)).collect();
+    let of = test_names(all).len();
     // Only scores of the leading kind compete; a score of the other kind is shown, with its dagger.
     let kind = leading_kind_unverified(&scores);
     let counts = |s: &Score| s.unverified == kind;
@@ -401,6 +420,19 @@ pub fn compare_panel(all: &[Results], width: usize) -> Panel {
     let mut l = Line::new();
     l.pad(2).text(&fit("× = times better than the first file (above 1 is better)", inner), FAINT);
     p.push(l);
+    // A mean over fewer tests than the table has is said, with the files it applies to.
+    let partial: Vec<String> = all
+        .iter()
+        .zip(&scores)
+        .filter_map(|(r, s)| s.and_then(|s| s.coverage(of)).map(|c| format!("{}: {c}", r.label)))
+        .collect();
+    if !partial.is_empty() {
+        for text in wrap(&format!("Overall over fewer tests than listed ({}).", partial.join("; ")), inner) {
+            let mut l = Line::new();
+            l.pad(2).text(&text, FAINT);
+            p.push(l);
+        }
+    }
     p.blank();
     p
 }
@@ -582,8 +614,8 @@ mod tests {
         let mut all = three();
         unverify(&mut all[1]);
         // The fast file has no number of the base's kind to set against it: only the latency, which has
-        // no kind, is left, and nothing is claimed for the unverified throughput numbers.
-        assert_eq!(overall(&all[1], &all[0]).map(|s| (s.value, s.unverified)), Some((0.5, false)));
+        // no kind, is left, and that alone is no ground for an overall ratio.
+        assert_eq!(overall(&all[1], &all[0]), None);
         // Half verified, half not: the verified half decides, and the other is not mixed in.
         let mut mixed = [sample("base", 1.0), sample("m", 2.0)];
         mixed[1].tests[0].check =
@@ -591,8 +623,41 @@ mod tests {
         mixed[1].tests[0].median = 1.0; // would pull a mixed mean down
         let s = overall(&mixed[1], &mixed[0]).expect("overall");
         assert!(!s.unverified);
+        assert_eq!(s.tests, 3);
         let verified_only: f64 = (2.0f64 * 2.0 * 0.5).powf(1.0 / 3.0);
         assert!((s.value - verified_only).abs() < 1e-9, "{}", s.value);
+    }
+
+    /// What the reviewer found: with every payload test of a different kind, the latency ratio alone
+    /// came out as a verified overall, and a file saved with `--no-verify` could lead.
+    #[test]
+    fn a_file_with_nothing_of_the_same_kind_has_no_overall_and_the_note_says_so() {
+        let mut all = three();
+        unverify(&mut all[1]);
+        let md = compare_markdown(&all);
+        let row = md.lines().last().unwrap_or_default();
+        // The file of another kind leads nothing: the base keeps the lead it has among the verified.
+        assert!(row.starts_with("| Overall vs Wormhole | **×1.00** | — |"), "{row}");
+        assert!(md.contains("No overall ratio (—) for a file with no test"), "{md}");
+        let mut out = Vec::new();
+        compare_panel(&all, 100).write(&mut out);
+        let screen = String::from_utf8_lossy(&out);
+        assert!(screen.contains("No overall ratio (—)"), "{screen}");
+        // Two files of one kind need no note.
+        assert!(!compare_markdown(&three()).contains("No overall ratio"));
+    }
+
+    #[test]
+    fn an_overall_over_fewer_tests_than_the_table_says_so() {
+        // `Slow` timed out on one test: its mean covers three of the four.
+        let all = three();
+        assert_eq!(overall(&all[2], &all[0]).map(|s| s.tests), Some(3));
+        let md = compare_markdown(&all);
+        let row = md.lines().last().unwrap_or_default();
+        assert!(row.contains("(3 of 4 tests)") && row.matches("of 4 tests").count() == 1, "{row}");
+        let mut out = Vec::new();
+        compare_panel(&all, 100).write(&mut out);
+        assert!(String::from_utf8_lossy(&out).contains("Slow: 3 of 4 tests"));
     }
 
     #[test]
