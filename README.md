@@ -5,8 +5,8 @@ same bytes can be measured in Wormhole, Ghostty, iTerm2, kitty, WezTerm, Alacrit
 and the animations are made to be recorded.
 
 It needs nothing but Rust's standard library, so it builds anywhere in seconds. It comes from
-[Wormhole](https://github.com/wormhole-terminal/wormhole), a terminal for working with AI coding
-agents, where it keeps the drawing fast, but it measures every terminal alike.
+[Wormhole](https://github.com/wormhole-terminal/wormhole), a fast, native Mac terminal, where it
+keeps the drawing fast, but it measures every terminal alike.
 
 Every animation and every benchmark is a command of its own: `matrix`, `doomfire`, `logflood`,
 `roundtrip`, … It is one program, `ttystorm`, that looks at the name it was started under, so each
