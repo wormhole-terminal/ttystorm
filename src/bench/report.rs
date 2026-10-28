@@ -5,7 +5,7 @@
 use super::integrity::{self, Check, Level};
 use super::results::{Results, TestResult, Unit};
 use super::stats;
-use super::ui::{ACCENT, BAD, DIM, FAINT, GOOD, Line, Panel, TEXT, fit};
+use super::ui::{ACCENT, BAD, DIM, FAINT, GOOD, Line, Panel, TEXT, fit, wrap};
 
 /// The width the panel aims for: wide enough for the bars to breathe, narrow enough to screenshot.
 pub fn panel_width(cols: u16) -> usize {
@@ -126,7 +126,16 @@ fn row(t: &TestResult, lay: &Layout) -> Line {
     } else {
         l.pad(1);
     }
-    push_value(&mut l, t, VALUE_W);
+    if t.unverified() {
+        // The number, with a dagger: the check did not vouch for it (the line under the header says why).
+        let (num, unit) = value_parts(t);
+        let shown = format!("{num} {unit} †");
+        l.pad(VALUE_W.saturating_sub(shown.chars().count()))
+            .bold(&num, TEXT)
+            .text(&format!(" {unit} †"), ACCENT);
+    } else {
+        push_value(&mut l, t, VALUE_W);
+    }
     if lay.spread {
         l.pad(2);
         let s = spread_text(t);
@@ -140,21 +149,6 @@ fn check_summary(r: &Results) -> Option<(Level, String)> {
     let checks: Vec<_> =
         r.tests.iter().filter_map(|t| t.check.as_ref().map(|c| (t.name.as_str(), c))).collect();
     integrity::summary(&checks)
-}
-
-/// `text` in lines of at most `width` characters, broken at spaces.
-fn wrap(text: &str, width: usize) -> Vec<String> {
-    let mut lines: Vec<String> = Vec::new();
-    for word in text.split_whitespace() {
-        match lines.last_mut() {
-            Some(last) if last.chars().count() + 1 + word.chars().count() <= width => {
-                last.push(' ');
-                last.push_str(word);
-            }
-            _ => lines.push(word.to_string()),
-        }
-    }
-    lines
 }
 
 /// The machine line, dropping the least useful parts from the end until it fits.
@@ -335,7 +329,7 @@ mod tests {
         assert!(results_plain(&r, None).contains("Input verified: all 48 checkpoints answered"));
         r.tests[1].check = Some(Check::Unchecked(Why::Silent));
         let text = results_plain(&r, None);
-        assert!(text.contains("Not verified: the terminal does not answer DSR 5"), "{text}");
+        assert!(text.contains("Not verified (colorflood): the terminal does not answer DSR 5"), "{text}");
         let line = text.lines().find(|l| l.starts_with("colorflood")).unwrap_or("");
         assert!(line.contains("MB/s") && line.contains("(unverified)"), "{line}");
         for width in [56, 80, 100] {
@@ -343,12 +337,6 @@ mod tests {
                 assert!(line.width() <= width, "width {width}, line {i}");
             }
         }
-    }
-
-    #[test]
-    fn wrapping_breaks_at_spaces() {
-        assert_eq!(wrap("aa bb cc dd", 5), vec!["aa bb", "cc dd"]);
-        assert_eq!(wrap("toolongword x", 4), vec!["toolongword", "x"]);
     }
 
     #[test]

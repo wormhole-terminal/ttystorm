@@ -1,6 +1,7 @@
 //! What the check found, as the results carry it: in the file, on the screen and in the comparison.
 
 use super::super::json::{self, Value};
+use super::ENOUGH;
 use super::probe::BURST;
 
 /// A test's input check.
@@ -25,18 +26,22 @@ pub enum Why {
     Lossy { answered: u64 },
     /// More answers than questions: the count proves nothing.
     Surplus { answered: u64, checkpoints: u64 },
-    /// The payload had no place for a checkpoint.
-    Nowhere,
+    /// All the checkpoints there were were answered, but there were fewer than [`ENOUGH`].
+    TooFew { checkpoints: u64 },
+    /// A result file from a newer ttystorm says something this one does not know.
+    Unknown,
 }
 
 impl Check {
     /// What the checkpoints of one run say: all answered, some missing, or too many.
     pub fn judge(checkpoints: u64, answered: u64) -> Check {
         match answered.cmp(&checkpoints) {
-            _ if checkpoints == 0 => Check::Unchecked(Why::Nowhere),
-            std::cmp::Ordering::Equal => Check::Verified { checkpoints },
             std::cmp::Ordering::Less => Check::Dropped { answered, checkpoints },
             std::cmp::Ordering::Greater => Check::Unchecked(Why::Surplus { answered, checkpoints }),
+            std::cmp::Ordering::Equal if checkpoints < ENOUGH => {
+                Check::Unchecked(Why::TooFew { checkpoints })
+            }
+            std::cmp::Ordering::Equal => Check::Verified { checkpoints },
         }
     }
 
@@ -92,7 +97,8 @@ impl Check {
                     Why::Silent => ("silent", 0, 0),
                     Why::Lossy { answered } => ("lossy", *answered, BURST),
                     Why::Surplus { answered, checkpoints } => ("surplus", *answered, *checkpoints),
-                    Why::Nowhere => ("nowhere", 0, 0),
+                    Why::TooFew { checkpoints } => ("few", *checkpoints, *checkpoints),
+                    Why::Unknown => ("unknown", 0, 0),
                 };
                 format!(
                     "{{\"status\": {}, \"reason\": {}, \"checkpoints\": {checkpoints}, \"answered\": {answered}}}",
@@ -103,22 +109,29 @@ impl Check {
         }
     }
 
+    /// A test's check from a results file. `None` only when the test has none (a file from before
+    /// the check, `roundtrip`); anything written there that this version cannot read is *unverified*,
+    /// never a clean number.
     pub fn from_value(v: &Value) -> Option<Check> {
+        if !matches!(v, Value::Obj(_)) {
+            return None;
+        }
         let n = |k: &str| v.get(k).and_then(Value::as_f64).unwrap_or(0.0) as u64;
         let (checkpoints, answered) = (n("checkpoints"), n("answered"));
-        match v.get("status").and_then(Value::as_str)? {
-            "verified" => Some(Check::Verified { checkpoints }),
-            "dropped" => Some(Check::Dropped { answered, checkpoints }),
-            "unchecked" => Some(Check::Unchecked(match v.get("reason").and_then(Value::as_str)? {
-                "off" => Why::Off,
-                "silent" => Why::Silent,
-                "lossy" => Why::Lossy { answered },
-                "surplus" => Why::Surplus { answered, checkpoints },
-                "nowhere" => Why::Nowhere,
-                _ => return None,
-            })),
-            _ => None,
-        }
+        let unknown = Check::Unchecked(Why::Unknown);
+        Some(match v.get("status").and_then(Value::as_str) {
+            Some("verified") => Check::Verified { checkpoints },
+            Some("dropped") => Check::Dropped { answered, checkpoints },
+            Some("unchecked") => match v.get("reason").and_then(Value::as_str) {
+                Some("off") => Check::Unchecked(Why::Off),
+                Some("silent") => Check::Unchecked(Why::Silent),
+                Some("lossy") => Check::Unchecked(Why::Lossy { answered }),
+                Some("surplus") => Check::Unchecked(Why::Surplus { answered, checkpoints }),
+                Some("few") => Check::Unchecked(Why::TooFew { checkpoints }),
+                _ => unknown,
+            },
+            _ => unknown,
+        })
     }
 }
 
@@ -134,7 +147,12 @@ impl Why {
             Why::Surplus { answered, checkpoints } => {
                 format!("the terminal sent {answered} answers to {checkpoints} questions")
             }
-            Why::Nowhere => "the workload has no place between sequences for a checkpoint".to_string(),
+            Why::TooFew { checkpoints } => format!(
+                "the workload has room for only {checkpoints} checkpoints (it takes {ENOUGH}) and all were answered"
+            ),
+            Why::Unknown => {
+                "the result file says something this version of ttystorm does not know".to_string()
+            }
         }
     }
 }
@@ -152,8 +170,20 @@ pub fn summary(checks: &[(&str, &Check)]) -> Option<(Level, String)> {
             ),
         ));
     }
-    if let Some((_, Check::Unchecked(why))) = checks.iter().find(|(_, c)| matches!(c, Check::Unchecked(_))) {
-        return Some((Level::Warn, format!("Not verified: {}.", why.sentence())));
+    let unverified: Vec<(&str, &Why)> = checks
+        .iter()
+        .filter_map(|(n, c)| match c {
+            Check::Unchecked(why) => Some((*n, why)),
+            _ => None,
+        })
+        .collect();
+    if let Some((_, why)) = unverified.first() {
+        let names: Vec<&str> = unverified.iter().map(|(n, _)| *n).collect();
+        let all = if names.len() == checks.len() { "all tests" } else { &names.join(", ") };
+        return Some((
+            Level::Warn,
+            format!("Not verified ({all}): {}. Unverified numbers do not rank in `compare`.", why.sentence()),
+        ));
     }
     let total: u64 = checks
         .iter()
@@ -186,7 +216,10 @@ mod tests {
         assert_eq!(Check::judge(16, 16), Check::Verified { checkpoints: 16 });
         assert_eq!(Check::judge(16, 3), Check::Dropped { answered: 3, checkpoints: 16 });
         assert_eq!(Check::judge(16, 17), Check::Unchecked(Why::Surplus { answered: 17, checkpoints: 16 }));
-        assert_eq!(Check::judge(0, 0), Check::Unchecked(Why::Nowhere));
+        assert_eq!(Check::judge(0, 0), Check::Unchecked(Why::TooFew { checkpoints: 0 }));
+        // Few, all answered: not verified. Few, one missing: still dropped.
+        assert_eq!(Check::judge(15, 15), Check::Unchecked(Why::TooFew { checkpoints: 15 }));
+        assert_eq!(Check::judge(15, 14), Check::Dropped { answered: 14, checkpoints: 15 });
     }
 
     #[test]
@@ -209,7 +242,8 @@ mod tests {
             Check::Unchecked(Why::Silent),
             Check::Unchecked(Why::Lossy { answered: 5 }),
             Check::Unchecked(Why::Surplus { answered: 50, checkpoints: 48 }),
-            Check::Unchecked(Why::Nowhere),
+            Check::Unchecked(Why::TooFew { checkpoints: 9 }),
+            Check::Unchecked(Why::Unknown),
         ] {
             let v = json::parse(&c.to_json()).expect("json");
             assert_eq!(Check::from_value(&v), Some(c.clone()), "{c:?}");
@@ -229,5 +263,28 @@ mod tests {
         assert_eq!(level, Level::Good);
         assert!(text.contains("32"), "{text}");
         assert!(summary(&[]).is_none());
+    }
+
+    #[test]
+    fn what_this_version_cannot_read_is_unverified_and_never_a_clean_number() {
+        let read = |text: &str| Check::from_value(&json::parse(text).expect("json"));
+        assert_eq!(read("{\"status\": \"checksummed\"}"), Some(Check::Unchecked(Why::Unknown)));
+        assert_eq!(
+            read("{\"status\": \"unchecked\", \"reason\": \"cosmic rays\"}"),
+            Some(Check::Unchecked(Why::Unknown))
+        );
+        assert_eq!(read("{}"), Some(Check::Unchecked(Why::Unknown)));
+        // Nothing there is a file from before the check.
+        assert_eq!(read("null"), None);
+    }
+
+    #[test]
+    fn the_summary_names_the_tests_that_are_not_verified() {
+        let ok = Check::Verified { checkpoints: 16 };
+        let few = Check::Unchecked(Why::TooFew { checkpoints: 9 });
+        let (_, text) = summary(&[("logflood", &ok), ("glyphstorm", &few)]).expect("summary");
+        assert!(text.starts_with("Not verified (glyphstorm)"), "{text}");
+        let (_, text) = summary(&[("glyphstorm", &few)]).expect("summary");
+        assert!(text.starts_with("Not verified (all tests)"), "{text}");
     }
 }

@@ -23,11 +23,11 @@ pub fn probe(input: &mut Input, out: &mut impl Write, late: Duration) -> io::Res
     input.count_status_replies();
     input.take_status_replies();
     let burst: Vec<u8> = QUERY.repeat(BURST as usize);
-    let ans = input.ask(out, &burst, PROBE_TIMEOUT)?;
+    input.ask(out, &burst, PROBE_TIMEOUT)?;
     // The status reports never reach `ask` (they are counted as they are read), so what it saw of
     // them is in the count. DA1 comes after them on a terminal that answers in order; one that
-    // answers it first gets `late` to finish.
-    let got = input.wait_status_replies(BURST, if ans.da1.is_some() { late } else { Duration::ZERO });
+    // answers it first, or is slow to answer at all, gets `late` to finish, DA1 or not.
+    let got = input.wait_status_replies(BURST, late);
     input.take_status_replies();
     Ok(match got {
         BURST => None,

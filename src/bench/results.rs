@@ -86,10 +86,22 @@ impl TestResult {
         self.extra.iter().find(|(k, _)| k == key).map(|(_, v)| *v)
     }
 
+    /// The input check could not vouch for this number (it was off, the terminal can't answer, the
+    /// workload has too few places for a checkpoint, ...).
+    pub fn unverified(&self) -> bool {
+        matches!(self.check, Some(Check::Unchecked(_)))
+    }
+
+    /// Whether this result may be ranked against others: a number, from a terminal that was seen to take
+    /// the input in. A terminal that opts out of the check (`--no-verify`) shows its number but does not
+    /// compete with it. Results from before the check (`check` is `None`) rank as they always did.
+    pub fn ranks(&self) -> bool {
+        self.unusable().is_none() && !self.unverified() && self.median > 0.0
+    }
+
     /// How many times better this is than `base` (above 1 is better, whichever way the unit goes).
     pub fn better_than(&self, base: &TestResult) -> Option<f64> {
-        if self.unusable().is_some() || base.unusable().is_some() || self.median <= 0.0 || base.median <= 0.0
-        {
+        if !self.ranks() || !base.ranks() {
             return None;
         }
         Some(if self.unit.higher_is_better() { self.median / base.median } else { base.median / self.median })

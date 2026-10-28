@@ -5,8 +5,8 @@
 //! each tick, a queue that sheds load) still answers that question, and fast: the question is in the
 //! newest bytes, which it kept. So the answer at the end says nothing about the bytes before it.
 //!
-//! The check asks along the way. At *checkpoints* spread through the payload, where no sequence or
-//! character is open, the writer adds `ESC [ 5 n` (DSR 5, "are you all right?"; the answer is
+//! The check asks along the way. At *checkpoints* spread through the payload, where no sequence,
+//! character or grapheme is open, the writer adds `ESC [ 5 n` (DSR 5, "are you all right?"; the answer is
 //! `ESC [ 0 n`). At the end the answers are counted. A terminal that dropped a stretch containing a
 //! checkpoint never answers it, and the run is reported as dropped input instead of a speed.
 //!
@@ -30,6 +30,10 @@ use crate::term::Input;
 pub use outcome::{Check, Level, Why, summary};
 pub use plan::{DEFAULT_EVERY, Plan, steps, write_step};
 
+/// Fewer checkpoints than this and a run is not called verified, only unverified ("too few"): a
+/// handful of answers is no evidence. A run that lost one is still called dropped.
+pub const ENOUGH: u64 = 16;
+
 /// The bytes a checkpoint adds to what is sent, and that its answer adds to what is received.
 pub const QUERY_BYTES: u64 = plan::QUERY.len() as u64;
 
@@ -38,13 +42,20 @@ pub const QUERY_BYTES: u64 = plan::QUERY.len() as u64;
 /// thread may be a little behind. Paid only when an answer is missing.
 const SETTLE: Duration = Duration::from_secs(3);
 
+/// Whether the terminal is a fair witness (`probe`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Fitness {
+    /// Not asked yet.
+    Unknown,
+    Fit,
+    Unfit(Why),
+}
+
 /// Plans, sends and counts the checkpoints of one `bench` invocation.
 pub struct Verifier {
     /// The distance between checkpoints; `None`: the check is off.
     every: Option<usize>,
-    /// What the up-front probe found: `None` before it ran, then `Some(None)` for a terminal that
-    /// can be trusted to count and `Some(Some(why))` for one that can't.
-    fit: Option<Option<Why>>,
+    fit: Fitness,
     settle: Duration,
     seed: u64,
 }
@@ -52,12 +63,12 @@ pub struct Verifier {
 impl Verifier {
     pub fn new(every: Option<usize>) -> Self {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(1, |d| d.as_nanos() as u64);
-        Self { every, fit: None, settle: SETTLE, seed: now }
+        Self { every, fit: Fitness::Unknown, settle: SETTLE, seed: now }
     }
 
     #[cfg(test)]
     fn for_test(every: usize) -> Self {
-        Self { every: Some(every), fit: None, settle: Duration::from_millis(60), seed: 99 }
+        Self { every: Some(every), fit: Fitness::Unknown, settle: Duration::from_millis(60), seed: 99 }
     }
 
     /// Why the check can't run, `None` when it can. The first call asks the terminal (see `probe`).
@@ -65,10 +76,16 @@ impl Verifier {
         if self.every.is_none() {
             return Ok(Some(Why::Off));
         }
-        if self.fit.is_none() {
-            self.fit = Some(probe::probe(input, out, self.settle)?);
+        if self.fit == Fitness::Unknown {
+            self.fit = match probe::probe(input, out, self.settle)? {
+                None => Fitness::Fit,
+                Some(why) => Fitness::Unfit(why),
+            };
         }
-        Ok(self.fit.clone().flatten())
+        Ok(match &self.fit {
+            Fitness::Unfit(why) => Some(why.clone()),
+            _ => None,
+        })
     }
 
     /// The checkpoints for the next run of `payload`; each run draws its own. Empty when the check
@@ -87,9 +104,9 @@ impl Verifier {
     }
 
     /// Call after the run was timed (so waiting here costs the measurement nothing): counts the answers,
-    /// waiting for stragglers only when some are missing.
-    pub fn finish(&mut self, input: &mut Input, plan: &Plan) -> Check {
-        let asked = plan.len() as u64;
+    /// waiting for stragglers only when some are missing. `asked` is how many queries the run really
+    /// wrote, not how many were planned.
+    pub fn finish(&mut self, input: &mut Input, asked: u64) -> Check {
         let answered = input.wait_status_replies(asked, self.settle);
         input.take_status_replies();
         Check::judge(asked, answered)

@@ -58,8 +58,7 @@ BENCHMARK OPTIONS
   --trace <file>  every write as a JSON line (test, run, time, bytes, how long it blocked)
   --no-verify     don't check that the terminal parsed everything: no checkpoints in the payload
                   (the numbers are then marked unverified)
-  --verify-every <KiB>  about how far apart the input check's checkpoints are (default 256;
-                  at most one per write)
+  --verify-every <KiB>  about how far apart the input check's checkpoints are (default 256)
   --only <a,b>    (bench) run only these benchmarks, or a group: realistic, stress, all
   --suite <name>  (bench) the same as --only <name>: realistic, stress or all
 ";

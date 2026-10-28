@@ -122,7 +122,13 @@ fn check_lines(t: &TestResult, r: &Results) -> Vec<String> {
             "input check: not made (this test has none, or the file is from before the check)".to_string(),
         ];
     };
-    let every = r.check_every.map_or(String::new(), |n| format!(", about every {} KiB", n / 1024));
+    // The distance the checkpoints really had, which a small payload or one with few places for a query
+    // makes shorter or longer than the one asked for.
+    let every = match (t.extra("checkpoint_distance"), r.check_every) {
+        (Some(d), _) => format!(", about one per {:.0} KiB", d / 1024.0),
+        (None, Some(n)) => format!(", asked for one per {} KiB", n / 1024),
+        (None, None) => String::new(),
+    };
     match check {
         Check::Verified { checkpoints } => vec![
             format!(
@@ -279,9 +285,10 @@ mod tests {
         let mut r = with_diag();
         r.check_every = Some(256 * 1024);
         r.tests[0].check = Some(Check::Verified { checkpoints: 48 });
+        r.tests[0].extra.push(("checkpoint_distance".to_string(), 300_000.0));
         let text = details(&r);
         assert!(
-            text.contains("input check: verified, 48 checkpoints in 3 runs, about every 256 KiB"),
+            text.contains("input check: verified, 48 checkpoints in 3 runs, about one per 293 KiB"),
             "{text}"
         );
         assert!(text.contains("--no-verify"), "{text}");

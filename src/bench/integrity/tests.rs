@@ -1,6 +1,7 @@
 //! The whole check against stand-ins for terminals: one that keeps its word, ones that don't, and one
 //! that shows what the check cannot see.
 
+use std::io;
 use std::ops::Range;
 use std::sync::mpsc::{self, Sender};
 use std::time::Duration;
@@ -29,6 +30,12 @@ enum Mode {
     /// Throws away all input except the queries, and answers those: what a terminal written to pass
     /// would do. The check cannot tell it from a faithful one.
     PicksQueriesOut,
+    /// Parses only the last `keep` bytes of every call to `write` or `writev`: it reads in the
+    /// writer's units and keeps the end of each.
+    TailOfEachCall { keep: usize },
+    /// Reads in ticks of `tick` bytes of the stream and parses only the last `keep` of each: a ring
+    /// overwritten between ticks, whose ticks have nothing to do with the writer's writes.
+    TailOfEachTick { tick: usize, keep: usize },
 }
 
 /// A terminal that is a function of the bytes written to it. Bytes at offsets in `lost` never reach
@@ -42,7 +49,12 @@ struct Fake {
     held: Vec<u8>,
     /// What its parser got.
     parsed: Vec<u8>,
+    /// How many bytes it was sent and how many reached its parser.
+    sent: usize,
+    kept: usize,
     dsr5_seen: u64,
+    /// Calls to the kernel: `write` and `writev` count alike.
+    calls: usize,
 }
 
 impl Fake {
@@ -56,7 +68,10 @@ impl Fake {
             window: Vec::new(),
             held: Vec::new(),
             parsed: Vec::new(),
+            sent: 0,
+            kept: 0,
             dsr5_seen: 0,
+            calls: 0,
         };
         (Input::with_receiver(rx), fake)
     }
@@ -89,17 +104,34 @@ impl Fake {
             self.send(&held);
         }
     }
-}
 
-impl io::Write for Fake {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        for &b in buf {
-            let at = self.offset;
-            self.offset += 1;
-            if !self.lost.contains(&at) {
+    /// Whether the byte at `at` in this call (of `len` bytes) reaches the parser.
+    fn reaches_parser(&self, at: usize, len: usize) -> bool {
+        let offset = self.offset + at;
+        if self.lost.contains(&offset) {
+            return false;
+        }
+        match self.mode {
+            Mode::TailOfEachCall { keep } => at + keep >= len,
+            Mode::TailOfEachTick { tick, keep } => offset % tick + keep >= tick,
+            _ => true,
+        }
+    }
+
+    /// One call to the kernel with these bytes.
+    fn take(&mut self, buf: &[u8]) {
+        self.calls += 1;
+        // The question that follows the payload is the newest thing it was sent: a terminal that
+        // keeps the end of what it reads keeps that.
+        let newest = buf == CPR_QUERY;
+        self.sent += buf.len();
+        for (at, &b) in buf.iter().enumerate() {
+            if newest || self.reaches_parser(at, buf.len()) {
                 self.window.push(b);
+                self.kept += 1;
             }
         }
+        self.offset += buf.len();
         let mut i = 0;
         while i < self.window.len() {
             let rest = &self.window[i..];
@@ -128,15 +160,26 @@ impl io::Write for Fake {
             }
         }
         self.window.drain(..i);
+    }
+}
+
+impl io::Write for Fake {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.take(buf);
         Ok(buf.len())
+    }
+
+    /// Like the kernel's `writev`: everything in one call, in order.
+    fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+        let all: Vec<u8> = bufs.iter().flat_map(|b| b.iter().copied()).collect();
+        self.take(&all);
+        Ok(all.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
 }
-
-use std::io;
 
 fn text(len: usize) -> Payload {
     Payload {
@@ -161,15 +204,16 @@ fn run_with(
     let mut v = Verifier::for_test(64 * 1024);
     // The probe goes first; the loss, if any, starts after it (offsets count from the payload).
     let why = v.unchecked(&mut input, &mut term).expect("probe");
-    term.offset = 0;
+    (term.offset, term.sent, term.kept, term.calls) = (0, 0, 0, 0);
     term.parsed.clear();
-    term.mode = measured;
-    term.lost = lost;
+    (term.mode, term.lost) = (measured, lost);
     let plan = v.plan(payload, why.is_none());
     v.begin(&mut input);
     let timed = time_payload(&mut input, &mut term, payload, &plan, Duration::from_secs(10)).expect("run");
-    assert!(timed.is_some(), "the cursor report was answered");
-    let check = why.is_none().then(|| v.finish(&mut input, &plan));
+    let timed = timed.expect("the cursor report was answered");
+    let asked: u64 = timed.writes.iter().map(|w| u64::from(w.checkpoints)).sum();
+    assert_eq!(asked, plan.len() as u64, "every planned checkpoint was written");
+    let check = why.is_none().then(|| v.finish(&mut input, asked));
     (why, check, term)
 }
 
@@ -182,6 +226,10 @@ fn a_terminal_that_answers_everything_is_verified_and_gets_the_payload_unchanged
     assert!(checkpoints >= 16, "{checkpoints}");
     // What the parser got is the payload, with nothing added: the queries are taken out of its input.
     assert!(term.parsed == p.bytes);
+    // The check costs no call to the kernel: one per write, and the cursor report's.
+    assert_eq!(term.calls, p.write_count() + 1);
+    // Four bytes more per query, and the cursor report's question.
+    assert_eq!(term.sent, p.bytes.len() + (checkpoints as usize + 1) * 4);
 }
 
 #[test]
@@ -202,6 +250,63 @@ fn a_terminal_that_keeps_only_the_tail_of_a_ring_is_caught() {
     let (_, check, _) = run(Mode::Faithful, 0..(p.bytes.len() - 64 * 1024), &p);
     let Some(Check::Dropped { answered, checkpoints }) = check else { panic!("{check:?}") };
     assert!(answered <= 3 && checkpoints >= 16, "{answered} of {checkpoints}");
+}
+
+/// What the reviewer found: the first design put each query at the end of a write, so a terminal that
+/// parses only the tail of what it reads, in the writer's units, answered every one of them.
+#[test]
+fn a_terminal_that_keeps_only_the_tail_of_each_write_is_caught() {
+    let p = text(6_000_000);
+    let (why, check, term) = run(Mode::TailOfEachCall { keep: 4096 }, 0..0, &p);
+    assert_eq!(why, None);
+    // It parsed about 6% of the run, and the check says so.
+    assert!((term.kept as f64) < 0.08 * term.sent as f64, "{} of {}", term.kept, term.sent);
+    let Some(Check::Dropped { answered, checkpoints }) = check else { panic!("{check:?}") };
+    assert!(answered * 4 < checkpoints, "{answered} of {checkpoints}");
+}
+
+/// The same for a ring whose ticks are not the writer's writes.
+#[test]
+fn a_terminal_that_keeps_the_tail_of_every_tick_is_caught() {
+    let p = text(4_000_000);
+    for tick in [65_536, 100_000, 1 << 20] {
+        let mode = Mode::TailOfEachTick { tick, keep: 4096 };
+        let (_, check, term) = run_with(Mode::Faithful, mode, 0..0, &p);
+        assert!((term.kept as f64) < 0.1 * term.sent as f64, "{tick}");
+        assert!(matches!(check, Some(Check::Dropped { .. })), "tick {tick}: {check:?}");
+    }
+}
+
+#[test]
+fn a_workload_with_room_for_few_checkpoints_is_unverified_not_verified() {
+    // Emoji everywhere and a pair of ASCII bytes now and then: a handful of places that may be cut.
+    let mut bytes = Vec::new();
+    while bytes.len() < 2_000_000 {
+        bytes.extend("😀".repeat(100_000).as_bytes());
+        bytes.extend(b"ab");
+    }
+    let p = Payload { bytes, ..Payload::default() };
+    let (_, check, _) = run(Mode::Faithful, 0..0, &p);
+    assert!(matches!(check, Some(Check::Unchecked(Why::TooFew { .. }))), "{check:?}");
+    // A terminal that lost one of the few is still caught.
+    let (_, check, _) = run(Mode::Faithful, 0..1_000_000, &p);
+    assert!(matches!(check, Some(Check::Dropped { .. })), "{check:?}");
+}
+
+#[test]
+fn the_terminal_is_judged_on_the_queries_written_not_the_ones_planned() {
+    let p = text(2_000_000);
+    let (mut input, mut term) = Fake::new(Mode::Faithful, 0..0);
+    let mut v = Verifier::for_test(64 * 1024);
+    assert_eq!(v.unchecked(&mut input, &mut term).expect("probe"), None);
+    let mut plan = v.plan(&p, true);
+    // A checkpoint no write can carry (past the end of the payload).
+    plan.cuts.push(p.bytes.len() + 10);
+    v.begin(&mut input);
+    let timed = time_payload(&mut input, &mut term, &p, &plan, Duration::from_secs(10)).expect("run");
+    let asked: u64 = timed.expect("answered").writes.iter().map(|w| u64::from(w.checkpoints)).sum();
+    assert_eq!(asked, plan.len() as u64 - 1);
+    assert!(matches!(v.finish(&mut input, asked), Check::Verified { .. }));
 }
 
 #[test]

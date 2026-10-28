@@ -3,10 +3,9 @@
 //! than the first file each one is. `--markdown` prints the same as a table to paste into an issue
 //! or a README instead.
 
-use super::integrity::Check;
 use super::report::{push_value, value_parts};
 use super::results::{Results, TestResult};
-use super::ui::{BAD, DIM, FAINT, GOOD, Line, Panel, TEXT, fit};
+use super::ui::{ACCENT, BAD, DIM, FAINT, GOOD, Line, Panel, TEXT, fit, wrap};
 use super::workloads;
 
 const VALUE_W: usize = 12;
@@ -35,7 +34,7 @@ fn find<'a>(r: &'a Results, name: &str) -> Option<&'a TestResult> {
 fn best_of(all: &[Results], name: &str) -> Option<usize> {
     let mut best: Option<(usize, &TestResult)> = None;
     for (i, r) in all.iter().enumerate() {
-        let Some(t) = find(r, name).filter(|t| t.unusable().is_none() && t.median > 0.0) else {
+        let Some(t) = find(r, name).filter(|t| t.ranks()) else {
             continue;
         };
         let better = match best {
@@ -119,6 +118,12 @@ fn terminal_row(
                 l.pad(VALUE_W.saturating_sub(used)).text(&format!("{num} {unit}"), DIM);
             }
         }
+        (None, Some(t)) => {
+            l.text(&fit(note, c.bar), ACCENT).pad_to(2 + 2 + c.label + 1 + c.bar).pad(2);
+            let (num, unit) = value_parts(t);
+            let shown = format!("{num} {unit} †");
+            l.pad(VALUE_W.saturating_sub(shown.chars().count())).text(&shown, DIM);
+        }
         _ => {
             l.text(&fit(note, c.bar + 2 + VALUE_W), BAD);
             l.pad_to(2 + 2 + c.label + 1 + c.bar + 2 + VALUE_W);
@@ -135,27 +140,31 @@ fn terminal_row(
 }
 
 /// What makes the files hard to compare: different machines or window sizes.
-fn warnings(all: &[Results]) -> Vec<&'static str> {
+fn warnings(all: &[Results]) -> Vec<String> {
     let base = &all[0];
     let same = |f: fn(&Results) -> String| all.iter().all(|r| f(r) == f(base));
     let mut warnings = Vec::new();
     if !same(|r| r.machine.cpu.clone()) {
-        warnings.push("These results come from different machines.");
+        warnings.push("These results come from different machines.".to_string());
     }
     if !same(|r| format!("{}×{}", r.cols, r.rows)) {
-        warnings.push("Terminal sizes differ, which changes the scrolling, cursor and frame tests.");
+        warnings
+            .push("Terminal sizes differ, which changes the scrolling, cursor and frame tests.".to_string());
     }
-    if all.iter().flat_map(|r| &r.tests).any(unverified) {
+    if all.iter().flat_map(|r| &r.tests).any(TestResult::unverified) {
         warnings.push(
-            "Numbers marked † are not verified: the input check could not run or decide for them, so a terminal that dropped input would not show.",
+            "Numbers marked † are not verified (the input check was off, or could not run or decide): they are shown, but do not rank and are left out of the overall ratio."
+                .to_string(),
+        );
+    }
+    let checked = |r: &Results| r.tests.iter().any(|t| t.check.is_some());
+    if all.iter().any(checked) && !all.iter().all(checked) {
+        warnings.push(
+            "Some files were saved before the input check existed: their numbers were never verified, and they rank as before."
+                .to_string(),
         );
     }
     warnings
-}
-
-/// Whether a usable number comes without the input check's word.
-fn unverified(t: &TestResult) -> bool {
-    t.unusable().is_none() && matches!(t.check, Some(Check::Unchecked(_)))
 }
 
 /// A cell's text in a markdown table: the unit with the number, `|` kept from ending the cell.
@@ -170,7 +179,7 @@ fn markdown_cell(t: Option<&TestResult>, best: bool) -> String {
         Some(t) => {
             let (num, unit) = value_parts(t);
             // A number the input check could not vouch for carries a dagger; the note says what it means.
-            let mark = if unverified(t) { " †" } else { "" };
+            let mark = if t.unverified() { " †" } else { "" };
             if best { format!("**{num} {unit}**{mark}") } else { format!("{num} {unit}{mark}") }
         }
     }
@@ -237,9 +246,11 @@ pub fn compare_panel(all: &[Results], width: usize) -> Panel {
     }
     let warnings = warnings(all);
     for w in warnings {
-        let mut l = Line::new();
-        l.pad(2).text(&fit(w, inner), BAD);
-        p.push(l);
+        for text in wrap(&w, inner) {
+            let mut l = Line::new();
+            l.pad(2).text(&text, BAD);
+            p.push(l);
+        }
     }
     p.blank();
     p.rule(2);
@@ -266,7 +277,7 @@ pub fn compare_panel(all: &[Results], width: usize) -> Panel {
             let t = find(r, &name);
             let ratio = t.zip(base_t).and_then(|(t, b)| t.better_than(b));
             let row = match (t, best_t) {
-                (Some(t), Some(b)) if t.unusable().is_none() && t.median > 0.0 => {
+                (Some(t), Some(b)) if t.ranks() => {
                     // The best fills the bar; the others are as long as they are good compared with it.
                     let frac = b.better_than(t).map(|x| 1.0 / x).unwrap_or(0.0).clamp(0.0, 1.0);
                     let is_best = best == Some(i);
@@ -282,6 +293,10 @@ pub fn compare_panel(all: &[Results], width: usize) -> Panel {
                 }
                 (Some(t), _) if t.unusable().is_some() => {
                     terminal_row(&c, &r.label, false, None, None, None, t.unusable().unwrap_or_default())
+                }
+                // A number without the input check's word: shown, not ranked, no bar.
+                (Some(t), _) if t.unverified() && t.median > 0.0 => {
+                    terminal_row(&c, &r.label, false, None, Some(t), None, "unverified, not ranked")
                 }
                 _ => terminal_row(&c, &r.label, false, None, None, None, "not measured"),
             };
@@ -446,7 +461,7 @@ mod tests {
 
     #[test]
     fn dropped_input_never_wins_and_unverified_numbers_carry_a_dagger() {
-        use super::super::integrity::Why;
+        use super::super::integrity::{Check, Why};
         let mut all = three();
         // The fast file dropped input: its (absurd) number is gone and the slower ones compare alone.
         all[1].tests[0].check = Some(Check::Dropped { answered: 1, checkpoints: 48 });
@@ -462,5 +477,46 @@ mod tests {
         let mut out = Vec::new();
         compare_panel(&all, 100).write(&mut out);
         assert!(String::from_utf8_lossy(&out).contains("dropped input"));
+    }
+
+    #[test]
+    fn a_terminal_that_opts_out_of_the_check_does_not_rank() {
+        use super::super::integrity::{Check, Why};
+        let ok = Check::Verified { checkpoints: 60 };
+        // The fast file switched the check off; the slower ones were verified.
+        let mut all = three();
+        for r in &mut all {
+            for t in &mut r.tests {
+                t.check = Some(ok.clone());
+            }
+        }
+        for t in &mut all[1].tests {
+            t.check = Some(Check::Unchecked(Why::Off));
+        }
+        // Not the best, whatever its number; no ratio; not in the overall.
+        assert_eq!(best_of(&all, "logflood"), Some(0));
+        assert_eq!(all[1].tests[0].better_than(&all[0].tests[0]), None);
+        assert_eq!(overall(&all[1], &all[0]), None);
+        let mut out = Vec::new();
+        compare_panel(&all, 100).write(&mut out);
+        let screen = String::from_utf8_lossy(&out);
+        assert!(screen.contains("unverified, not ranked") && screen.contains(" †"), "{screen}");
+        // The dagger is explained, in full, on lines of their own.
+        assert!(screen.contains("Numbers marked †") && screen.contains("overall ratio."), "{screen}");
+        let md = compare_markdown(&all);
+        let row = md.lines().find(|l| l.starts_with("| logflood")).unwrap_or_default();
+        assert!(row.contains("1600 MB/s †") && !row.contains("**1600"), "{row}");
+    }
+
+    #[test]
+    fn mixing_files_from_before_the_check_with_checked_ones_is_said() {
+        use super::super::integrity::Check;
+        let mut all = three();
+        for t in &mut all[0].tests {
+            t.check = Some(Check::Verified { checkpoints: 60 });
+        }
+        let md = compare_markdown(&all);
+        assert!(md.contains("saved before the input check existed"), "{md}");
+        assert!(!compare_markdown(&three()).contains("input check"));
     }
 }

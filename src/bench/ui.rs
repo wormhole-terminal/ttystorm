@@ -37,6 +37,21 @@ pub fn fit(s: &str, max: usize) -> String {
 }
 
 /// One row of a panel: escape sequences and the number of cells they take.
+/// `text` in lines of at most `width` characters, broken at spaces (a longer word has a line of its own).
+pub fn wrap(text: &str, width: usize) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    for word in text.split_whitespace() {
+        match lines.last_mut() {
+            Some(last) if last.chars().count() + 1 + word.chars().count() <= width => {
+                last.push(' ');
+                last.push_str(word);
+            }
+            _ => lines.push(word.to_string()),
+        }
+    }
+    lines
+}
+
 #[derive(Default)]
 pub struct Line {
     buf: Vec<u8>,
@@ -146,6 +161,12 @@ impl Panel {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn wrapping_breaks_at_spaces() {
+        assert_eq!(wrap("aa bb cc dd", 5), vec!["aa bb", "cc dd"]);
+        assert_eq!(wrap("toolongword x", 4), vec!["toolongword", "x"]);
+    }
+
     use super::*;
 
     #[test]

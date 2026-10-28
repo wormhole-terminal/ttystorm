@@ -118,7 +118,10 @@ impl<W: Write> Runner<'_, W> {
             let after = self.process.as_ref().and_then(|p| procinfo::sample(p.pid));
             // After the clock stopped: waiting for stragglers here costs the measurement nothing.
             if unchecked.is_none() {
-                let check = self.verifier.finish(self.input, &plan);
+                // What was really written, not what was planned: the terminal is judged on the former.
+                let asked = timed.writes.iter().map(|w| u64::from(w.checkpoints)).sum();
+                debug_assert_eq!(asked, plan.len() as u64, "a planned checkpoint was never written");
+                let check = self.verifier.finish(self.input, asked);
                 if check.is_dropped() {
                     return Ok(Step::Done(Box::new(dropped_result(name, &main, check))));
                 }
@@ -141,6 +144,12 @@ impl<W: Write> Runner<'_, W> {
             None => Check::merge(&checks),
         };
         let mut result = throughput_result(name, &main, &rates, &times, Some(diag));
+        // The distance the checkpoints really had, which is not the one asked for in a small payload or
+        // a payload with few places for one.
+        if let Some(Check::Verified { checkpoints }) = &check {
+            let distance = main.bytes.len() as f64 * checks.len() as f64 / (*checkpoints).max(1) as f64;
+            result.extra.push(("checkpoint_distance".to_string(), distance.round()));
+        }
         result.check = check;
         Ok(Step::Done(Box::new(result)))
     }
@@ -192,7 +201,7 @@ pub fn time_payload(
             end_ns: (now - start).as_nanos() as u64,
             took_ns: (now - last).as_nanos() as u64,
             bytes: step.data.len(),
-            checkpoint: step.query,
+            checkpoints: step.queries() as u32,
         });
         last = now;
         if now > deadline {

@@ -5,9 +5,12 @@
 //! any of those the query's own bytes would become part of the payload's sequence and change what the
 //! payload means.
 //!
-//! This is a scanner of its own and not `term::scan`, which reads what a terminal sends back. It errs
-//! on the side of "still open": where terminals disagree about how a malformed sequence ends, it
-//! stays out of the way, so a point it calls closed is closed for every parser.
+//! This is a scanner of its own and not `term::scan`, which reads what a terminal sends back. It follows
+//! the state machine of xterm-style parsers: ESC, CSI, strings that end with ST (or BEL for an OSC), CAN
+//! and SUB, UTF-8. Where such parsers are known to differ on a malformed sequence (a BEL in a DCS, a
+//! control character inside a CSI) it stays "open". That is its judgement of the cases it knows, not a
+//! promise about every parser. C1 controls (a raw 0x80-0x9f, or U+0080-U+009F as UTF-8) are not modelled;
+//! no payload contains one (a test checks), and the plan only cuts between two ASCII bytes.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum State {
@@ -53,7 +56,7 @@ impl Scanner {
 
     pub fn feed(&mut self, b: u8) {
         use State::*;
-        // CAN and SUB cancel whatever is open, in every parser.
+        // CAN and SUB cancel whatever is open in the parsers this follows (xterm's, VT500's).
         if matches!(b, 0x18 | 0x1a) {
             self.state = Ground;
             return;
