@@ -177,8 +177,9 @@ All of them but some after the cursor report: *unverified* (see "How the answers
 - *In order.* The cursor report that ends the run is asked after the last byte, so a terminal with one
   reply channel, which is practically every terminal, has sent all its status reports before it. ttystorm
   counts how many it had read when the cursor report arrived (exactly: the reports in front of it, also
-  within one read). If any came after it, the terminal answered the cursor report ahead of the queries, or
-  from another thread, and the time ended before it was through the payload: the result is *unverified*
+  within one read). If any came after it, the terminal answered the cursor report ahead of the queries,
+  answered them from another thread, or flushes its status replies later than its cursor report, and the
+  time may have ended before it was through the payload: the result is *unverified*
   ("answered out of order"), however many answers there were in the end, and it is not called dropped as
   long as they all come. A terminal that answers in order is unaffected.
 - *Is the terminal a fair witness?* Before the first measured test, with the terminal idle, ttystorm
@@ -221,7 +222,7 @@ not verified in 95% of the runs, losing 1% in 45%, losing 0.1% in 6% (with 31 ch
 Each of the runs of a test has its own chance, and "dropped" needs the patient repeat to miss as well
 (0.45 × 0.45, about 20% per run at 1% loss): of a test of three runs that loses 1% in short spans, about
 half come out dropped, about a third unverified (the repeat verified) and about a sixth verified (60
-checkpoints, runs and repeats independent; 0.1% loss: 1%, 16% and 83%). Stand-ins that keep only the last
+checkpoints, runs and repeats independent; 0.1% loss: 1%, 15% and 84%). Stand-ins that keep only the last
 64 KiB of the whole stream, the last 4 KiB of each write (6% of the bytes parsed), and the last 4 KiB
 of every tick of 64 KiB, 100,000 bytes and 1 MiB, are all caught by tests; so is a terminal that loses
 a stretch in the middle. (Velocitty itself was not run: a ring overwritten each tick is what the stand-ins
@@ -274,14 +275,23 @@ do.)
   verified ones, do compare. `--details` says how many checkpoints a run had and how far apart.
 - The wait for stragglers happens after the clock has stopped, and only when an answer is missing.
 
-*Replaying the checkpoints.* The places are drawn from a seed, by default from the clock. Each run's seed is
-in `--details` (for the run shown), in `--trace` (a `{"event":"plan","checkpoint_seed":…}` line before each
-run's writes) and in the `--save` file; `--verify-seed <n>` (1 to 9007199254740991, so that a JSON number
-holds it) takes the invocation's seed back and puts the checkpoints where they were, for the same options,
-terminal size and tests. A seed describes where the queries go, not the terminal's behaviour.
+*Replaying the checkpoints.* An invocation has one seed, by default drawn from the clock. The places of a
+run's checkpoints follow from that seed, the test's name, the run's number and the try (the first or the
+patient repeat), and from nothing else: not from what ran before, and not from a repeat after a shortfall
+somewhere else. So `--verify-seed <n>` puts every run of every test where it was, also when only one
+test is run (`--only`), if the options (`--size`, `--verify-every`), the terminal's size and the ttystorm
+version are the same. What to pass is the *invocation's* seed: `check_seed` in the `--save` file, the
+`verify_seed` of the first line of the `--trace` file, or the one `--details` names; not the seed of a
+single run (that one, in `diag.runs[].checkpoint_seed`, the `plan` lines of the trace and `--details`, says
+where that run's checkpoints fell). `n` is a whole number from 1 to 9007199254740991 (so that a JSON number
+holds it); with `--no-verify` there are no checkpoints and the option is an error. A seed describes where
+the queries go, not the terminal's behaviour: a terminal that loses input at random loses it differently
+each time.
 
 Files: `check_every_bytes` at the top level of a `--save` file is the distance asked for (`null` with
-`--no-verify`) and `check_seed` the seed of the invocation (`null` with `--no-verify`); per test `check` is
+`--no-verify`) and `check_seed` the seed of the invocation (`null` with `--no-verify`); per test `check_seeds`
+lists the seeds of the two tries of a test that came out dropped (it has no `diag` to hold them; empty
+otherwise); per test `check` is
 `{"status": "verified"|"dropped"|"unchecked", "checkpoints": n, "answered": n}`, and for `unchecked` a
 `reason`: `off`, `silent`, `lossy`, `surplus`, `few`, `out_of_order`, `retried` or `unknown`. What `answered`
 and `checkpoints` count depends on it: for `lossy`, `checkpoints` is the idle probe's burst (16) and
@@ -291,7 +301,8 @@ many were in by the cursor report; for `retried`, they are the first try's count
 `checkpoint_seed`. `extra.checkpoint_distance` is the average distance the checkpoints really had in a
 verified test (bytes per checkpoint), and `extra.checkpoints_unwritten` appears if a planned checkpoint was
 never carried by a write (it is not held against the terminal). A test with `status: dropped` has
-`median: 0`. `check` is `null` for `roundtrip`, for a test that timed out and for files from before the
+`median: 0`. A file that says `tool_version` 1.1.0 and carries a `check` was written by a development build of
+the check; it is read as unverified. `check` is `null` for `roundtrip`, for a test that timed out and for files from before the
 check.
 
 ### Why a terminal is fast or slow
@@ -356,11 +367,16 @@ and `samples` for `roundtrip`) and `diag` (`null` for `roundtrip` and for files 
 | `runs[].write_us` | `p50`, `p99`, `max` of how long a write took, in µs |
 | `runs[].stalls` | `over_ms` (20), `count`, `total_s`, `longest` (up to 8 of `{at_s, ms}`, by time into the run) |
 | `runs[].timeline` | `bucket_ms` (100) and `mb_per_s`, one value per bucket, the last one partial |
+| `runs[].checkpoint_seed` | what that run's checkpoints were drawn from (`null` without the check) |
 | `runs[].terminal` | `cpu_s`, `rss_start_kb`, `rss_end_kb` of the terminal process during the run; `null` when not measured |
 
-The `--trace` file is JSON Lines, one event per write of every measured run (not the warm-up):
+The `--trace` file is JSON Lines, one event per write of every measured run (not the warm-up). With the
+input check on, the first line is `{"event":"check","verify_seed":…,"verify_every_bytes":…}` (the seed
+`--verify-seed` takes), and a `plan` line before each run's writes gives that run's own seed and how many
+checkpoints it carried:
 
 ```json
+{"test":"logflood","run":1,"event":"plan","checkpoint_seed":4503599627370496,"checkpoints":60}
 {"test":"logflood","run":1,"event":"write","t_ms":12.345,"bytes":65536,"write_ms":0.412,"cum_bytes":131072,"checkpoints":0}
 {"test":"logflood","run":1,"event":"dsr","t_ms":40.1,"wait_ms":6.2,"cum_bytes":16000512}
 ```
