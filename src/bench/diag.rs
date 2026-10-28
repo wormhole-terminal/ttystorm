@@ -218,7 +218,8 @@ fn run_json(r: &RunDiag) -> String {
         opt(r.cpu_s),
         opt(r.rss_start_kb.map(|k| k as f64)),
         opt(r.rss_end_kb.map(|k| k as f64)),
-        opt(r.seed.map(|n| n as f64)),
+        // A whole number: `opt` rounds to thousandths, which loses the low digits of a large seed.
+        r.seed.map_or("null".to_string(), |n| n.to_string()),
     )
 }
 
@@ -259,6 +260,12 @@ fn run_from_value(v: &Value) -> RunDiag {
         rss_end_kb: n(term, "rss_end_kb").map(|k| k as u64),
         seed: v.get("checkpoint_seed").and_then(Value::as_f64).map(|n| n as u64),
     }
+}
+
+/// The first line of a `--trace` file when the input check is on: the seed `--verify-seed` takes back and
+/// the distance asked for, which the places of every run's checkpoints follow from.
+pub fn write_trace_header(out: &mut impl Write, seed: u64, every_bytes: usize) -> io::Result<()> {
+    writeln!(out, "{{\"event\":\"check\",\"verify_seed\":{seed},\"verify_every_bytes\":{every_bytes}}}")
 }
 
 /// Every write of a run as JSON Lines, then the wait for the answer: the `--trace` file.
@@ -599,7 +606,7 @@ mod tests {
             secs: 1.0,
             dsr_wait_s: 0.1,
             writes: vec![ev(10.0, 1.0, 100), ev(500.0, 300.0, 100)],
-            seed: Some(9_007_199_254_740_991),
+            seed: Some(7_624_267_924_332_224),
         };
         let a = ProcSample { cpu_s: 1.0, rss_kb: 1000 };
         let d = TestDiag {
@@ -611,9 +618,14 @@ mod tests {
         let back = TestDiag::from_value(&v).expect("reads back");
         // Numbers are written to three decimals, so compare what a second trip writes.
         assert_eq!(back.to_json(), d.to_json());
-        assert_eq!((back.composition.clone(), back.median_run, back.runs.len()), (d.composition, 1, 2));
-        // The seed of a run is exact up to the largest the check hands out.
-        assert_eq!(back.runs[0].seed, Some(9_007_199_254_740_991));
+        assert_eq!(
+            (back.composition.clone(), back.median_run, back.runs.len()),
+            (d.composition.clone(), 1, 2)
+        );
+        // A seed is written as the whole number it is: rounding to thousandths, as for the other numbers,
+        // turned this one into ...225.
+        assert!(d.to_json().contains("\"checkpoint_seed\": 7624267924332224"), "{}", d.to_json());
+        assert_eq!(back.runs[0].seed, Some(7_624_267_924_332_224));
     }
 
     #[test]
@@ -635,6 +647,18 @@ mod tests {
         );
         assert!(lines[2].contains("\"event\":\"dsr\"") && lines[2].contains("\"wait_ms\":100.000"));
         assert!(lines.iter().all(|l| json::parse(l).is_ok()));
+    }
+
+    #[test]
+    fn the_trace_starts_with_the_seed_of_the_invocation() {
+        let mut out = Vec::new();
+        write_trace_header(&mut out, 7_624_267_924_332_224, 262_144).expect("writes to a vec");
+        let text = String::from_utf8_lossy(&out);
+        assert_eq!(
+            text.trim_end(),
+            "{\"event\":\"check\",\"verify_seed\":7624267924332224,\"verify_every_bytes\":262144}"
+        );
+        assert!(json::parse(&text).is_ok());
     }
 
     #[test]

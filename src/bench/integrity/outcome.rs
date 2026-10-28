@@ -3,8 +3,8 @@
 use std::cmp::Ordering;
 
 use super::super::json::{self, Value};
-use super::ENOUGH;
 use super::probe::BURST;
+use super::{ENOUGH, SETTLE};
 
 /// A test's input check.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -165,11 +165,24 @@ impl Check {
 }
 
 impl Why {
+    /// The reason without its numbers: what two tests have in common when they are unverified for the
+    /// same reason, though the counts differ.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Why::Off => "off",
+            Why::Silent => "silent",
+            Why::Lossy { .. } => "lossy",
+            Why::Surplus { .. } => "surplus",
+            Why::TooFew { .. } => "few",
+            Why::OutOfOrder { .. } => "out_of_order",
+            Why::Retried { .. } => "retried",
+            Why::Unknown => "unknown",
+        }
+    }
+
     /// The reason in a sentence, for the result screen and `--details`.
     pub fn sentence(&self) -> String {
         match self {
-            Why::Off => "the input check was turned off (--no-verify)".to_string(),
-            Why::Silent => "the terminal does not answer DSR 5 (ESC [ 5 n)".to_string(),
             Why::Lossy { answered } => format!(
                 "the terminal answered only {answered} of {BURST} DSR 5 queries sent in a row, even when idle"
             ),
@@ -180,10 +193,33 @@ impl Why {
                 "the workload has room for only {checkpoints} checkpoints (it takes {ENOUGH}) and all were answered"
             ),
             Why::OutOfOrder { before_report, checkpoints } => format!(
-                "all {checkpoints} checkpoints were answered, but only {before_report} before the cursor report that ended the run: the terminal answers from another thread or out of order, and the time may end before it has parsed everything"
+                "all {checkpoints} checkpoints were answered, but only {before_report} before the cursor report that ended the run: the terminal answers from another thread or out of order, and the time may have ended before it had parsed everything"
             ),
-            Why::Retried { answered, checkpoints } => format!(
-                "{answered} of {checkpoints} checkpoints were answered after 3 s; the run was repeated and all were, so the terminal answers slowly or unevenly"
+            // A file from a dev build wrote this without counts.
+            Why::Retried { answered, checkpoints } if *checkpoints > 0 => format!(
+                "{answered} of {checkpoints} checkpoints were answered after {} s; the run was repeated and all were, so the terminal answers slowly or unevenly",
+                SETTLE.as_secs()
+            ),
+            other => other.general(),
+        }
+    }
+
+    /// The same without the counts, for several tests at once.
+    pub fn general(&self) -> String {
+        match self {
+            Why::Off => "the input check was turned off (--no-verify)".to_string(),
+            Why::Silent => "the terminal does not answer DSR 5 (ESC [ 5 n)".to_string(),
+            Why::Lossy { .. } => {
+                format!("the terminal answered only some of {BURST} DSR 5 queries sent in a row, even when idle")
+            }
+            Why::Surplus { .. } => "the terminal sent more answers than questions".to_string(),
+            Why::TooFew { .. } => {
+                format!("the workload has room for fewer than {ENOUGH} checkpoints and all were answered")
+            }
+            Why::OutOfOrder { .. } => "all checkpoints were answered, but not all before the cursor report that ended the run: the terminal answers from another thread or out of order, and the time may have ended before it had parsed everything".to_string(),
+            Why::Retried { .. } => format!(
+                "answers were missing after {} s; the run was repeated and all came, so the terminal answers slowly or unevenly",
+                SETTLE.as_secs()
             ),
             Why::Unknown => {
                 "the result file says something this version of ttystorm does not know".to_string()
@@ -234,16 +270,16 @@ pub fn summary(checks: &[(&str, &Check)]) -> Option<(Level, String)> {
     })
 }
 
-/// The tests that are not verified, a sentence for each reason with the tests it applies to; `None`
-/// when there are none.
+/// The tests that are not verified, a sentence for each kind of reason with the tests it applies to;
+/// `None` when there are none. Tests with the same reason and other counts share a sentence, without
+/// the counts.
 fn unverified_text(checks: &[(&str, &Check)]) -> Option<String> {
-    let mut groups: Vec<(String, Vec<&str>)> = Vec::new();
+    let mut groups: Vec<(&str, Vec<(&str, &Why)>)> = Vec::new();
     for (name, check) in checks {
         let Check::Unchecked(why) = check else { continue };
-        let reason = why.sentence();
-        match groups.iter_mut().find(|(r, _)| *r == reason) {
-            Some((_, names)) => names.push(name),
-            None => groups.push((reason, vec![name])),
+        match groups.iter_mut().find(|(kind, _)| *kind == why.kind()) {
+            Some((_, members)) => members.push((name, why)),
+            None => groups.push((why.kind(), vec![(name, why)])),
         }
     }
     if groups.is_empty() {
@@ -251,8 +287,12 @@ fn unverified_text(checks: &[(&str, &Check)]) -> Option<String> {
     }
     let parts: Vec<String> = groups
         .iter()
-        .map(|(reason, names)| {
+        .map(|(_, members)| {
+            let names: Vec<&str> = members.iter().map(|(n, _)| *n).collect();
             let which = if names.len() == checks.len() { "all tests".to_string() } else { names.join(", ") };
+            let first = members[0].1;
+            let same = members.iter().all(|(_, why)| *why == first);
+            let reason = if same { first.sentence() } else { first.general() };
             format!("Not verified ({which}): {reason}.")
         })
         .collect();
@@ -395,6 +435,29 @@ mod tests {
             "{text}"
         );
         assert_eq!(text.matches("rank only among themselves").count(), 1, "{text}");
+    }
+
+    #[test]
+    fn the_same_reason_with_other_counts_is_one_group_without_the_counts() {
+        let a = Check::Unchecked(Why::TooFew { checkpoints: 9 });
+        let b = Check::Unchecked(Why::TooFew { checkpoints: 12 });
+        let (_, text) = summary(&[("glyphstorm", &a), ("editstorm", &b)]).expect("summary");
+        assert_eq!(text.matches("Not verified").count(), 1, "{text}");
+        assert!(
+            text.contains("Not verified (all tests): the workload has room for fewer than 16 checkpoints"),
+            "{text}"
+        );
+        // Equal counts keep them.
+        let (_, text) = summary(&[("glyphstorm", &a), ("editstorm", &a)]).expect("summary");
+        assert!(text.contains("room for only 9 checkpoints"), "{text}");
+    }
+
+    #[test]
+    fn a_retry_from_a_dev_file_without_counts_does_not_say_0_of_0() {
+        let text = Why::Retried { answered: 0, checkpoints: 0 }.sentence();
+        assert!(!text.contains("0 of 0") && text.contains("after 3 s"), "{text}");
+        let text = Why::Retried { answered: 31, checkpoints: 48 }.sentence();
+        assert!(text.starts_with("31 of 48 checkpoints were answered after 3 s"), "{text}");
     }
 
     #[test]

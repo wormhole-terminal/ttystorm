@@ -123,6 +123,11 @@ pub fn run(opts: &BenchOptions) -> io::Result<()> {
             trace,
             verifier: integrity::Verifier::new(opts.verify_every, opts.verify_seed),
         };
+        if let (Some(trace), Some(seed), Some(every)) =
+            (&mut runner.trace, runner.verifier.seed(), opts.verify_every)
+        {
+            diag::write_trace_header(trace, seed, every)?;
+        }
         let mut tests = Vec::new();
         let mut interrupted = false;
         for (i, name) in names.iter().enumerate() {

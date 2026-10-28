@@ -8,6 +8,9 @@ use super::fake::{Fake, Mode, text};
 use super::*;
 use crate::bench::runner::time_payload;
 
+/// The run the helpers plan for.
+const SLOT: Slot<'static> = Slot { test: "logflood", run: 0, attempt: 0 };
+
 /// The first look at a run's answers, as the runner takes it.
 fn first_look(v: &mut Verifier, input: &mut Input, asked: u64) -> Check {
     let wait = v.settle();
@@ -33,7 +36,7 @@ fn run_with(
     (term.offset, term.sent, term.kept, term.calls) = (0, 0, 0, 0);
     term.parsed.clear();
     (term.mode, term.lost) = (measured, lost);
-    let plan = v.plan(payload, why.is_none());
+    let plan = v.plan(payload, why.is_none(), SLOT);
     v.begin(&mut input);
     let timed = time_payload(&mut input, &mut term, payload, &plan, Duration::from_secs(10)).expect("run");
     let timed = timed.expect("the cursor report was answered");
@@ -125,7 +128,7 @@ fn the_terminal_is_judged_on_the_queries_written_not_the_ones_planned() {
     let (mut input, mut term) = Fake::new(Mode::Faithful, 0..0);
     let mut v = Verifier::for_test(64 * 1024);
     assert_eq!(v.unchecked(&mut input, &mut term).expect("probe"), None);
-    let mut plan = v.plan(&p, true);
+    let mut plan = v.plan(&p, true, SLOT);
     // A checkpoint no write can carry (past the end of the payload).
     plan.cuts.push(p.bytes.len() + 10);
     v.begin(&mut input);
@@ -210,7 +213,7 @@ fn the_check_can_be_turned_off() {
     let (mut input, mut term) = Fake::new(Mode::Faithful, 0..0);
     let mut v = Verifier::new(None, None);
     assert_eq!(v.unchecked(&mut input, &mut term).expect("probe"), Some(Why::Off));
-    assert_eq!(v.plan(&text(1_000_000), false), Plan::none());
+    assert_eq!(v.plan(&text(1_000_000), false, SLOT), Plan::none());
     assert_eq!(term.dsr5_seen, 0);
 }
 
@@ -221,7 +224,7 @@ fn answers_that_are_late_but_all_come_are_not_called_dropped() {
     let mut v = Verifier::for_test(64 * 1024);
     assert_eq!(v.unchecked(&mut input, &mut term).expect("probe"), None);
     term.mode = Mode::Delayed { ms: 200 };
-    let plan = v.plan(&p, true);
+    let plan = v.plan(&p, true, SLOT);
     v.begin(&mut input);
     let timed = time_payload(&mut input, &mut term, &p, &plan, Duration::from_secs(10)).expect("run");
     let asked: u64 = timed.expect("answered").writes.iter().map(|w| u64::from(w.checkpoints)).sum();
@@ -234,7 +237,7 @@ fn answers_that_are_late_but_all_come_are_not_called_dropped() {
     // ... and a patient look at a run whose answers all come, late, is neither dropped nor verified.
     let patience = v.patience();
     v.begin(&mut input);
-    let plan = v.plan(&p, true);
+    let plan = v.plan(&p, true, SLOT);
     let timed = time_payload(&mut input, &mut term, &p, &plan, Duration::from_secs(10)).expect("run");
     let asked: u64 = timed.expect("answered").writes.iter().map(|w| u64::from(w.checkpoints)).sum();
     let again = v.finish(&mut input, asked, patience);
@@ -248,7 +251,7 @@ fn answers_that_never_come_stay_missing_after_the_longer_wait() {
     let mut v = Verifier::for_test(64 * 1024);
     // The probe's burst fits in the tail it keeps.
     assert_eq!(v.unchecked(&mut input, &mut term).expect("probe"), None);
-    let plan = v.plan(&p, true);
+    let plan = v.plan(&p, true, SLOT);
     v.begin(&mut input);
     let timed = time_payload(&mut input, &mut term, &p, &plan, Duration::from_secs(10)).expect("run");
     let asked: u64 = timed.expect("answered").writes.iter().map(|w| u64::from(w.checkpoints)).sum();
@@ -269,21 +272,24 @@ fn a_repeat_that_verifies_is_unverified_and_one_that_drops_again_is_dropped() {
 }
 
 #[test]
-fn a_seed_places_the_checkpoints_again() {
+fn a_seed_places_the_checkpoints_of_each_run_again_whatever_else_ran() {
     let p = text(2_000_000);
-    let plans = |seed| {
-        let mut v = Verifier::new(Some(64 * 1024), Some(seed));
-        (v.seed(), v.plan(&p, true), v.plan(&p, true))
-    };
-    let (seed, first, second) = plans(1234);
-    assert_eq!(seed, Some(1234));
-    // The same seed, the same places, run after run; another seed, other places.
-    assert_eq!((first.clone(), second.clone()), {
-        let (_, a, b) = plans(1234);
-        (a, b)
-    });
+    let slot = |test, run, attempt| Slot { test, run, attempt };
+    let v = Verifier::new(Some(64 * 1024), Some(1234));
+    assert_eq!(v.seed(), Some(1234));
+    let (first, second) =
+        (v.plan(&p, true, slot("logflood", 0, 0)), v.plan(&p, true, slot("logflood", 1, 0)));
+    // The same seed puts a test's run where it was, in any order and next to any other runs ...
+    let other = Verifier::new(Some(64 * 1024), Some(1234));
+    other.plan(&p, true, slot("colorflood", 0, 0));
+    other.plan(&p, true, slot("logflood", 0, 1));
+    assert_eq!(other.plan(&p, true, slot("logflood", 1, 0)), second);
+    assert_eq!(other.plan(&p, true, slot("logflood", 0, 0)), first);
+    // ... another run, test, try or seed puts it elsewhere.
     assert_ne!(first.cuts, second.cuts);
-    assert_ne!(first.cuts, plans(1235).1.cuts);
+    assert_ne!(first.cuts, v.plan(&p, true, slot("colorflood", 0, 0)).cuts);
+    assert_ne!(first.cuts, v.plan(&p, true, slot("logflood", 0, 1)).cuts);
+    assert_ne!(first.cuts, Verifier::new(Some(64 * 1024), Some(1235)).plan(&p, true, SLOT).cuts);
     // Every seed that is reported is one a JSON number holds and the generator takes as it is.
     for plan in [first, second] {
         assert!(plan.seed.is_some_and(|s| (1..=MAX_SEED).contains(&s)), "{:?}", plan.seed);
@@ -293,5 +299,18 @@ fn a_seed_places_the_checkpoints_again() {
         assert!(v.seed().is_some_and(|s| (1..=MAX_SEED).contains(&s)));
     }
     assert_eq!(Verifier::new(None, Some(5)).seed(), None);
-    assert_eq!(Verifier::new(Some(1), None).plan(&Payload::default(), false), Plan::none());
+    assert_eq!(Verifier::new(Some(1), None).plan(&Payload::default(), false, SLOT), Plan::none());
+}
+
+/// What the reviewer found: the clock's nanoseconds were clamped to the range, so every invocation
+/// got the largest seed and the same places.
+#[test]
+fn two_invocations_without_a_seed_draw_different_places() {
+    let p = text(2_000_000);
+    let a = Verifier::new(Some(64 * 1024), None);
+    std::thread::sleep(Duration::from_millis(2));
+    let b = Verifier::new(Some(64 * 1024), None);
+    assert_ne!(a.seed(), b.seed());
+    assert!(a.seed().is_some_and(|s| s != MAX_SEED));
+    assert_ne!(a.plan(&p, true, SLOT).cuts, b.plan(&p, true, SLOT).cuts);
 }

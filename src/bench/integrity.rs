@@ -17,12 +17,14 @@
 //! length of what was lost; it is not a proof against a terminal written to pass it.
 //!
 //! Modules: `scan` (where it is safe to ask), `plan` (the checkpoints and how the writes carry them),
-//! `probe` (is the terminal a fair witness), `outcome` (the verdict and its place in the results).
+//! `seed` (where their places are drawn from), `probe` (is the terminal a fair witness), `outcome` (the
+//! verdict and its place in the results).
 
 mod outcome;
 mod plan;
 mod probe;
 mod scan;
+mod seed;
 
 use std::io::{self, Write};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -31,6 +33,7 @@ use super::workloads::Payload;
 use crate::term::Input;
 pub use outcome::{Check, Level, Why, summary};
 pub use plan::{DEFAULT_EVERY, Plan, chunks, write_chunk};
+pub use seed::{MAX_SEED, Slot};
 
 /// Fewer checkpoints than this and a run is not called verified, only unverified ("too few"): a
 /// handful of answers is no evidence. A run that lost one is still called dropped.
@@ -56,13 +59,6 @@ enum Fitness {
     Unfit(Why),
 }
 
-/// The largest seed: a JSON number holds integers up to 2^53 exactly, so every seed that is shown or
-/// saved can be given back to `--verify-seed`.
-pub const MAX_SEED: u64 = (1 << 53) - 1;
-/// What each plan's seed moves on by (the 64-bit golden ratio), so that the plans of one invocation
-/// are unrelated.
-const SEED_STEP: u64 = 0x9E37_79B9_7F4A_7C15;
-
 /// Plans, sends and counts the checkpoints of one `bench` invocation.
 pub struct Verifier {
     /// The distance between checkpoints; `None`: the check is off.
@@ -70,18 +66,20 @@ pub struct Verifier {
     fit: Fitness,
     settle: Duration,
     patience: Duration,
-    /// Where the invocation's seeds start; the plans draw theirs from it in order.
+    /// The invocation's seed; each plan's is derived from it and the run it is for (`seed`).
     seed: u64,
-    plans: u64,
 }
 
 impl Verifier {
     /// `seed` replays the checkpoints of an earlier invocation (`--verify-seed`); by default it comes
     /// from the clock, so that no run can be told by its checkpoints from another.
     pub fn new(every: Option<usize>, seed: Option<u64>) -> Self {
-        let clock = || SystemTime::now().duration_since(UNIX_EPOCH).map_or(1, |d| d.as_nanos() as u64);
-        let seed = seed.unwrap_or_else(clock).clamp(1, MAX_SEED);
-        Self { every, fit: Fitness::Unknown, settle: SETTLE, patience: PATIENCE, seed, plans: 0 }
+        let clock = || {
+            let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(1, |d| d.as_nanos() as u64);
+            seed::from_clock(nanos)
+        };
+        let seed = seed.map_or_else(clock, seed::given);
+        Self { every, fit: Fitness::Unknown, settle: SETTLE, patience: PATIENCE, seed }
     }
 
     #[cfg(test)]
@@ -92,11 +90,10 @@ impl Verifier {
             settle: Duration::from_millis(60),
             patience: Duration::from_millis(500),
             seed: 99,
-            plans: 0,
         }
     }
 
-    /// The seed the invocation's plans start from, for the results; `None` when the check is off.
+    /// The invocation's seed, for the results and `--verify-seed`; `None` when the check is off.
     pub fn seed(&self) -> Option<u64> {
         self.every.map(|_| self.seed)
     }
@@ -128,17 +125,12 @@ impl Verifier {
         })
     }
 
-    /// The checkpoints for the next run of `payload`; each run draws its own. Empty when the check
-    /// can't run.
-    pub fn plan(&mut self, payload: &Payload, usable: bool) -> Plan {
+    /// The checkpoints for the run `slot` of `payload`. Empty when the check can't run. The places are a
+    /// function of the invocation's seed and the slot, so a replay with the same seed puts every run
+    /// where it was, whatever else ran.
+    pub fn plan(&self, payload: &Payload, usable: bool, slot: Slot<'_>) -> Plan {
         match self.every {
-            Some(every) if usable => {
-                self.plans += 1;
-                let seed = self.seed.wrapping_add(self.plans.wrapping_mul(SEED_STEP)) & MAX_SEED;
-                // The generator takes a seed of 0 as 1; keeping it out of the range keeps what is
-                // reported what was used.
-                Plan::new(payload, every, seed.max(1))
-            }
+            Some(every) if usable => Plan::new(payload, every, seed::for_slot(self.seed, slot)),
             _ => Plan::none(),
         }
     }

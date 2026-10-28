@@ -62,8 +62,10 @@ BENCHMARK OPTIONS
                   about how far apart the input check's checkpoints are (default 256, 4 to 65536);
                   never more than a 32nd of the payload
   --verify-seed <n>
-                  place the checkpoints as an earlier run did (its seed is in --details, --trace and
-                  the --save file); by default they fall differently every time
+                  put the checkpoints where an earlier invocation had them: n is that invocation's
+                  seed (`check_seed` in its --save file, the first line of its --trace, --details),
+                  not a run's. With the same options and terminal size, every test's runs get the same
+                  places whatever else is run with them. By default they fall differently every time
   --only <a,b>    (bench) run only these benchmarks, or a group: realistic, stress, all
   --suite <name>  (bench) the same as --only <name>: realistic, stress or all
 ";
@@ -302,6 +304,9 @@ fn bench_options(args: &[String]) -> io::Result<bench::BenchOptions> {
         }
         i += 1;
     }
+    if o.verify_seed.is_some() && o.verify_every.is_none() {
+        return Err(io::Error::other("--verify-seed has nothing to place with --no-verify"));
+    }
     Ok(o)
 }
 
@@ -370,6 +375,10 @@ mod tests {
             assert!(bench_options(&args(&["--verify-seed", bad])).is_err(), "{bad}");
         }
         assert!(bench_options(&args(&["--verify-seed"])).is_err());
+        // With the check off there are no checkpoints to place: an error, not an option ignored.
+        assert!(bench_options(&args(&["--verify-seed", "5", "--no-verify"])).is_err());
+        assert!(bench_options(&args(&["--no-verify", "--verify-seed", "5"])).is_err());
+        assert!(bench_options(&args(&["--no-verify"])).is_ok());
     }
 
     /// The commands `run` matches before any animation or benchmark.

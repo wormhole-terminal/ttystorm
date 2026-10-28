@@ -153,12 +153,22 @@ fn check_lines(t: &TestResult, r: &Results) -> Vec<String> {
         ],
         Check::Unchecked(why) => vec![format!("input check: not verified, {}", why.sentence())],
     };
-    // Where the queries fell is drawn from a seed; with it the same places can be asked for again.
-    if let Some(seed) = t.diag.as_ref().and_then(|d| d.median()).and_then(|run| run.seed) {
+    // Where the queries fell is drawn from a seed per run, itself derived from the invocation's.
+    let run_seed = t.diag.as_ref().and_then(|d| d.median()).and_then(|run| run.seed);
+    let seeds = match (run_seed, t.seeds.as_slice()) {
+        (Some(seed), _) => Some(format!("{seed} in the run shown")),
+        (None, [first, second]) => Some(format!("{first} in the first try, {second} in the repeat")),
+        (None, [only]) => Some(format!("{only} in the only try")),
+        _ => None,
+    };
+    if let Some(seeds) = seeds {
         let replay = r.check_seed.map_or(String::new(), |base| {
-            format!("; --verify-seed {base} puts the checkpoints of every run where they were")
+            format!(
+                "; the invocation's seed is {base}: --verify-seed {base} puts every run of this test where it was, \
+                 whatever else is run with it, if the options and the terminal's size are the same"
+            )
         });
-        lines.push(format!("  checkpoint seed: {seed} in the run shown{replay}"));
+        lines.push(format!("  checkpoint seed: {seeds}{replay}"));
     }
     if let Some(n) = t.extra("checkpoints_unwritten") {
         lines.push(format!(
@@ -341,7 +351,18 @@ mod tests {
         }
         let text = details(&r);
         assert!(
-            text.contains("checkpoint seed: 4242 in the run shown; --verify-seed 777 puts the checkpoints of every run where they were"),
+            text.contains("checkpoint seed: 4242 in the run shown; the invocation's seed is 777: --verify-seed 777 puts every run of this test where it was"),
+            "{text}"
+        );
+        // A dropped test has no diagnostics, and its two tries' seeds are told all the same.
+        r.tests[0].diag = None;
+        r.tests[0].check = Some(Check::Dropped { answered: 3, checkpoints: 48 });
+        r.tests[0].seeds = vec![11, 12];
+        let text = details(&r);
+        assert!(
+            text.contains(
+                "checkpoint seed: 11 in the first try, 12 in the repeat; the invocation's seed is 777"
+            ),
             "{text}"
         );
     }
