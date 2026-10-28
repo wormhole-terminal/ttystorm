@@ -144,12 +144,22 @@ fn check_lines(t: &TestResult, r: &Results) -> Vec<String> {
         ],
         Check::Dropped { answered, checkpoints } => vec![
             format!("input check: DROPPED INPUT, {answered} of {checkpoints} checkpoints answered{every}"),
-            "  The terminal read the bytes but did not parse all of them (or did not answer for them), so the time \
-             measured how fast it discarded input, and no number is given."
-                .to_string(),
+            format!(
+                "  {} of {checkpoints} checkpoints went unanswered, in a repeat of the run that waited patiently as well: \
+                 the terminal lost input or withheld answers, so the time would have measured how fast it \
+                 discarded input, and no number is given.",
+                checkpoints.saturating_sub(*answered)
+            ),
         ],
         Check::Unchecked(why) => vec![format!("input check: not verified, {}", why.sentence())],
     };
+    // Where the queries fell is drawn from a seed; with it the same places can be asked for again.
+    if let Some(seed) = t.diag.as_ref().and_then(|d| d.median()).and_then(|run| run.seed) {
+        let replay = r.check_seed.map_or(String::new(), |base| {
+            format!("; --verify-seed {base} puts the checkpoints of every run where they were")
+        });
+        lines.push(format!("  checkpoint seed: {seed} in the run shown{replay}"));
+    }
     if let Some(n) = t.extra("checkpoints_unwritten") {
         lines.push(format!(
             "  note: {n:.0} planned checkpoints were never written and are not held against the terminal"
@@ -313,5 +323,26 @@ mod tests {
         r.tests[0].check = Some(Check::Dropped { answered: 3, checkpoints: 48 });
         let text = details(&r);
         assert!(text.contains("logflood  dropped input") && text.contains("3 of 48"), "{text}");
+        assert!(
+            text.contains("45 of 48 checkpoints went unanswered")
+                && text.contains("lost input or withheld answers"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_seed_of_the_checkpoints_is_given_with_the_way_to_use_it() {
+        let mut r = with_diag();
+        r.tests[0].check = Some(Check::Verified { checkpoints: 48 });
+        assert!(!details(&r).contains("checkpoint seed"));
+        r.check_seed = Some(777);
+        if let Some(d) = &mut r.tests[0].diag {
+            d.runs[0].seed = Some(4242);
+        }
+        let text = details(&r);
+        assert!(
+            text.contains("checkpoint seed: 4242 in the run shown; --verify-seed 777 puts the checkpoints of every run where they were"),
+            "{text}"
+        );
     }
 }

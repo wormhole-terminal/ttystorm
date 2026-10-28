@@ -63,7 +63,7 @@ pub struct TestResult {
     /// More numbers worth keeping: p90 and p99 for latency, MB/s for frames, writes per second for
     /// `agentstream`.
     pub extra: Vec<(String, f64)>,
-    /// Where the time went, run by run (`None` for latency and for files saved before 1.2).
+    /// Where the time went, run by run (`None` for latency and for files saved before 1.1.0).
     pub diag: Option<TestDiag>,
     /// Whether the terminal parsed everything (`integrity`); `None` for latency, for a timeout and for
     /// files saved before the check existed.
@@ -131,6 +131,9 @@ pub struct Results {
     /// The distance between checkpoints in bytes (`integrity`), `None` when the check was off or the
     /// file is older than the check.
     pub check_every: Option<u64>,
+    /// What the checkpoints of the whole invocation were drawn from (`--verify-seed` takes it back);
+    /// `None` under the same conditions.
+    pub check_seed: Option<u64>,
     /// The terminal's process, when it could be found.
     pub process: Option<Terminal>,
     pub tests: Vec<TestResult>,
@@ -164,6 +167,7 @@ impl Results {
         field("runs", self.runs.to_string());
         field("diag_version", DIAG_VERSION.to_string());
         field("check_every_bytes", self.check_every.map_or("null".to_string(), |n| n.to_string()));
+        field("check_seed", self.check_seed.map_or("null".to_string(), |n| n.to_string()));
         field("terminal_process", self.process.as_ref().map_or("null".to_string(), Terminal::to_json));
         s.push_str("  \"tests\": [\n");
         for (i, t) in self.tests.iter().enumerate() {
@@ -250,6 +254,7 @@ impl Results {
             size_mb: num_of("size_mb"),
             runs: num_of("runs") as usize,
             check_every: v.get("check_every_bytes").and_then(Value::as_f64).map(|n| n as u64),
+            check_seed: v.get("check_seed").and_then(Value::as_f64).map(|n| n as u64),
             process: v.get("terminal_process").and_then(Terminal::from_value),
             tests,
         })
@@ -288,6 +293,7 @@ pub fn sample(label: &str, scale: f64) -> Results {
         size_mb: 16.0,
         runs: 3,
         check_every: None,
+        check_seed: None,
         process: None,
         tests: vec![
             t("logflood", Unit::MBps, 800.0),
@@ -307,6 +313,18 @@ mod tests {
         let r = sample("Wormhole", 1.0);
         let back = Results::from_json(&r.to_json()).expect("reads back");
         assert_eq!(back, r);
+    }
+
+    #[test]
+    fn the_seed_of_the_checkpoints_survives_the_file() {
+        let mut r = sample("x", 1.0);
+        r.check_every = Some(262_144);
+        r.check_seed = Some(9_007_199_254_740_991);
+        let back = Results::from_json(&r.to_json()).expect("reads back");
+        assert_eq!(back.check_seed, Some(9_007_199_254_740_991));
+        // Files from before it have none.
+        let old = r.to_json().replace("\"check_seed\"", "\"x_check_seed\"");
+        assert_eq!(Results::from_json(&old).expect("reads").check_seed, None);
     }
 
     #[test]

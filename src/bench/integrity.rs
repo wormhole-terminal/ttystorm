@@ -7,8 +7,10 @@
 //!
 //! The check asks along the way. At *checkpoints* spread through the payload, where no sequence,
 //! character or grapheme is open, the writer adds `ESC [ 5 n` (DSR 5, "are you all right?"; the answer is
-//! `ESC [ 0 n`). At the end the answers are counted. A terminal that dropped a stretch containing a
-//! checkpoint never answers it, and the run is reported as dropped input instead of a speed.
+//! `ESC [ 0 n`). At the end the answers are counted, and so is how many of them had arrived when the
+//! cursor report did. A terminal that dropped a stretch containing a checkpoint never answers it, and the
+//! run is reported as dropped input instead of a speed; one whose answers come after the cursor report
+//! (it answers from another thread, say) is not called dropped, but its number cannot be verified.
 //!
 //! What it can and cannot prove is in the README ("Is the number real?"); the short version: it
 //! catches a terminal that loses input, by design or under load, with a certainty that grows with the
@@ -28,7 +30,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use super::workloads::Payload;
 use crate::term::Input;
 pub use outcome::{Check, Level, Why, summary};
-pub use plan::{DEFAULT_EVERY, Plan, steps, write_step};
+pub use plan::{DEFAULT_EVERY, Plan, chunks, write_chunk};
 
 /// Fewer checkpoints than this and a run is not called verified, only unverified ("too few"): a
 /// handful of answers is no evidence. A run that lost one is still called dropped.
@@ -54,6 +56,13 @@ enum Fitness {
     Unfit(Why),
 }
 
+/// The largest seed: a JSON number holds integers up to 2^53 exactly, so every seed that is shown or
+/// saved can be given back to `--verify-seed`.
+pub const MAX_SEED: u64 = (1 << 53) - 1;
+/// What each plan's seed moves on by (the 64-bit golden ratio), so that the plans of one invocation
+/// are unrelated.
+const SEED_STEP: u64 = 0x9E37_79B9_7F4A_7C15;
+
 /// Plans, sends and counts the checkpoints of one `bench` invocation.
 pub struct Verifier {
     /// The distance between checkpoints; `None`: the check is off.
@@ -61,13 +70,18 @@ pub struct Verifier {
     fit: Fitness,
     settle: Duration,
     patience: Duration,
+    /// Where the invocation's seeds start; the plans draw theirs from it in order.
     seed: u64,
+    plans: u64,
 }
 
 impl Verifier {
-    pub fn new(every: Option<usize>) -> Self {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(1, |d| d.as_nanos() as u64);
-        Self { every, fit: Fitness::Unknown, settle: SETTLE, patience: PATIENCE, seed: now }
+    /// `seed` replays the checkpoints of an earlier invocation (`--verify-seed`); by default it comes
+    /// from the clock, so that no run can be told by its checkpoints from another.
+    pub fn new(every: Option<usize>, seed: Option<u64>) -> Self {
+        let clock = || SystemTime::now().duration_since(UNIX_EPOCH).map_or(1, |d| d.as_nanos() as u64);
+        let seed = seed.unwrap_or_else(clock).clamp(1, MAX_SEED);
+        Self { every, fit: Fitness::Unknown, settle: SETTLE, patience: PATIENCE, seed, plans: 0 }
     }
 
     #[cfg(test)]
@@ -78,7 +92,23 @@ impl Verifier {
             settle: Duration::from_millis(60),
             patience: Duration::from_millis(500),
             seed: 99,
+            plans: 0,
         }
+    }
+
+    /// The seed the invocation's plans start from, for the results; `None` when the check is off.
+    pub fn seed(&self) -> Option<u64> {
+        self.every.map(|_| self.seed)
+    }
+
+    /// How long a first look at the answers waits for the ones still missing.
+    pub fn settle(&self) -> Duration {
+        self.settle
+    }
+
+    /// How long the repeat of a run waits.
+    pub fn patience(&self) -> Duration {
+        self.patience
     }
 
     /// Why the check can't run, `None` when it can. The first call asks the terminal (see `probe`).
@@ -101,9 +131,14 @@ impl Verifier {
     /// The checkpoints for the next run of `payload`; each run draws its own. Empty when the check
     /// can't run.
     pub fn plan(&mut self, payload: &Payload, usable: bool) -> Plan {
-        self.seed = self.seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
         match self.every {
-            Some(every) if usable => Plan::new(payload, every, self.seed),
+            Some(every) if usable => {
+                self.plans += 1;
+                let seed = self.seed.wrapping_add(self.plans.wrapping_mul(SEED_STEP)) & MAX_SEED;
+                // The generator takes a seed of 0 as 1; keeping it out of the range keeps what is
+                // reported what was used.
+                Plan::new(payload, every, seed.max(1))
+            }
             _ => Plan::none(),
         }
     }
@@ -114,41 +149,38 @@ impl Verifier {
     }
 
     /// Call after the run was timed (so waiting here costs the measurement nothing): counts the answers,
-    /// waiting for stragglers only when some are missing. `asked` is how many queries the run really
-    /// wrote, not how many were planned. When the verdict is "dropped" the count is kept, for
-    /// `late_answers`.
-    pub fn finish(&mut self, input: &mut Input, asked: u64) -> Check {
-        let check = Check::judge(asked, input.wait_status_replies(asked, self.settle));
+    /// waiting up to `wait` for stragglers, and only when some are missing. `asked` is how many
+    /// queries the run really wrote, not how many were planned. When the verdict is "dropped" the count
+    /// is kept, for `await_stragglers`.
+    pub fn finish(&mut self, input: &mut Input, asked: u64, wait: Duration) -> Check {
+        let answered = input.wait_status_replies(asked, wait);
+        // `sync` found the cursor report the run ended with; without it nothing is known about the order.
+        let in_time = input.status_replies_before_report().unwrap_or(0);
+        let check = Check::judge(asked, answered, in_time);
         if !check.is_dropped() {
             input.take_status_replies();
         }
         check
     }
 
-    /// The same, for the repeat of a run that came out dropped: it waits as long as `PATIENCE`.
-    pub fn finish_patiently(&mut self, input: &mut Input, asked: u64) -> Check {
-        let check = Check::judge(asked, input.wait_status_replies(asked, self.patience));
+    /// For a run that came out dropped: waits on, up to `PATIENCE`, for the answers still missing, so
+    /// that none of them is counted in the repeat of the run. A terminal that answers late may still
+    /// have them all by then, but the run's number is not kept: its time ended before they came.
+    pub fn await_stragglers(&mut self, input: &mut Input, asked: u64) {
+        input.wait_status_replies(asked, self.patience);
         input.take_status_replies();
-        check
-    }
-
-    /// For a run that came out dropped: waits on, up to `PATIENCE`, for the answers still missing. Some
-    /// terminals answer more than the first wait allows. `Some` when they all came: the numbers are
-    /// real, the check is not clean (`Why::Retried`), and the run need not be repeated.
-    pub fn late_answers(&mut self, input: &mut Input, asked: u64) -> Option<Check> {
-        let answered = input.wait_status_replies(asked, self.patience);
-        input.take_status_replies();
-        (answered >= asked).then_some(Check::Unchecked(Why::Retried))
     }
 }
 
 /// The verdict on a run that was repeated because the first try was dropped: dropped again stays
 /// dropped; verified now is *unverified*, not verified, because the first try lost answers and the
 /// terminal can't be told from one that is slow or uneven (the numbers are the repeat's).
-pub fn after_retry(second: Check) -> Check {
-    match second {
-        Check::Verified { .. } => Check::Unchecked(Why::Retried),
-        other => other,
+pub fn after_retry(first: &Check, second: Check) -> Check {
+    match (first, second) {
+        (Check::Dropped { answered, checkpoints }, Check::Verified { .. }) => {
+            Check::Unchecked(Why::Retried { answered: *answered, checkpoints: *checkpoints })
+        }
+        (_, other) => other,
     }
 }
 

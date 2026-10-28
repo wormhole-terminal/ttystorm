@@ -1,5 +1,7 @@
 //! What the check found, as the results carry it: in the file, on the screen and in the comparison.
 
+use std::cmp::Ordering;
+
 use super::super::json::{self, Value};
 use super::ENOUGH;
 use super::probe::BURST;
@@ -7,9 +9,11 @@ use super::probe::BURST;
 /// A test's input check.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Check {
-    /// Every checkpoint was answered, exactly once: `checkpoints` over all the measured runs.
+    /// Every checkpoint was answered, exactly once, before the cursor report that ended the run:
+    /// `checkpoints` over all the measured runs.
     Verified { checkpoints: u64 },
-    /// Fewer answers than questions: the terminal did not parse (or did not keep) everything it was sent.
+    /// Fewer answers than questions, even a patient repeat later: the terminal lost input or withheld
+    /// answers.
     Dropped { answered: u64, checkpoints: u64 },
     /// The check could not decide, and the number is shown without it.
     Unchecked(Why),
@@ -22,28 +26,36 @@ pub enum Why {
     Off,
     /// The terminal did not answer DSR 5 when it was idle.
     Silent,
-    /// Idle, it answered only `answered` of the queries asked in a row: it cannot be counted on.
+    /// Idle, it answered only `answered` of the [`BURST`] queries asked in a row: it cannot be counted
+    /// on.
     Lossy { answered: u64 },
     /// More answers than questions: the count proves nothing.
     Surplus { answered: u64, checkpoints: u64 },
     /// All the checkpoints there were were answered, but there were fewer than [`ENOUGH`].
     TooFew { checkpoints: u64 },
-    /// Answers were missing at first and all came when ttystorm waited longer or repeated the run.
-    Retried,
+    /// All the checkpoints were answered, but only `before_report` of them before the cursor report that
+    /// ended the run: the time was taken before the terminal had got through what it was sent.
+    OutOfOrder { before_report: u64, checkpoints: u64 },
+    /// `answered` of `checkpoints` had been answered 3 s after the run (the first try's count); the run
+    /// was repeated and then all of them were.
+    Retried { answered: u64, checkpoints: u64 },
     /// A result file from a newer ttystorm says something this one does not know.
     Unknown,
 }
 
 impl Check {
-    /// What the checkpoints of one run say: all answered, some missing, or too many.
-    pub fn judge(checkpoints: u64, answered: u64) -> Check {
+    /// What the checkpoints of one run say: all answered, some missing, or too many. `in_time` is how
+    /// many answers had arrived when the cursor report did: a terminal answers in order, so for one
+    /// that does, the cursor report comes after all of them.
+    pub fn judge(checkpoints: u64, answered: u64, in_time: u64) -> Check {
         match answered.cmp(&checkpoints) {
-            std::cmp::Ordering::Less => Check::Dropped { answered, checkpoints },
-            std::cmp::Ordering::Greater => Check::Unchecked(Why::Surplus { answered, checkpoints }),
-            std::cmp::Ordering::Equal if checkpoints < ENOUGH => {
-                Check::Unchecked(Why::TooFew { checkpoints })
+            Ordering::Less => Check::Dropped { answered, checkpoints },
+            Ordering::Greater => Check::Unchecked(Why::Surplus { answered, checkpoints }),
+            Ordering::Equal if in_time < checkpoints => {
+                Check::Unchecked(Why::OutOfOrder { before_report: in_time, checkpoints })
             }
-            std::cmp::Ordering::Equal => Check::Verified { checkpoints },
+            Ordering::Equal if checkpoints < ENOUGH => Check::Unchecked(Why::TooFew { checkpoints }),
+            Ordering::Equal => Check::Verified { checkpoints },
         }
     }
 
@@ -80,6 +92,9 @@ impl Check {
         }
     }
 
+    /// The check as a results file has it. For `unchecked`, `checkpoints` and `answered` mean what the
+    /// reason says (README, "Files"): the idle probe's burst for `lossy`, the answers in by the cursor
+    /// report for `out_of_order`, the first try's counts for `retried`.
     pub fn to_json(&self) -> String {
         let q = json::quote;
         match self {
@@ -100,7 +115,10 @@ impl Check {
                     Why::Lossy { answered } => ("lossy", *answered, BURST),
                     Why::Surplus { answered, checkpoints } => ("surplus", *answered, *checkpoints),
                     Why::TooFew { checkpoints } => ("few", *checkpoints, *checkpoints),
-                    Why::Retried => ("retried", 0, 0),
+                    Why::OutOfOrder { before_report, checkpoints } => {
+                        ("out_of_order", *before_report, *checkpoints)
+                    }
+                    Why::Retried { answered, checkpoints } => ("retried", *answered, *checkpoints),
                     Why::Unknown => ("unknown", 0, 0),
                 };
                 format!(
@@ -123,7 +141,11 @@ impl Check {
         let (checkpoints, answered) = (n("checkpoints"), n("answered"));
         let unknown = Check::Unchecked(Why::Unknown);
         Some(match v.get("status").and_then(Value::as_str) {
-            Some("verified") => Check::Verified { checkpoints },
+            // Verified says what it counted; a file that claims it without enough to go on (a hand-written
+            // one, or from a version with another idea of enough) is not taken at its word.
+            Some("verified") if checkpoints >= ENOUGH && answered == checkpoints => {
+                Check::Verified { checkpoints }
+            }
             Some("dropped") => Check::Dropped { answered, checkpoints },
             Some("unchecked") => match v.get("reason").and_then(Value::as_str) {
                 Some("off") => Check::Unchecked(Why::Off),
@@ -131,7 +153,10 @@ impl Check {
                 Some("lossy") => Check::Unchecked(Why::Lossy { answered }),
                 Some("surplus") => Check::Unchecked(Why::Surplus { answered, checkpoints }),
                 Some("few") => Check::Unchecked(Why::TooFew { checkpoints }),
-                Some("retried") => Check::Unchecked(Why::Retried),
+                Some("out_of_order") => {
+                    Check::Unchecked(Why::OutOfOrder { before_report: answered, checkpoints })
+                }
+                Some("retried") => Check::Unchecked(Why::Retried { answered, checkpoints }),
                 _ => unknown,
             },
             _ => unknown,
@@ -154,7 +179,12 @@ impl Why {
             Why::TooFew { checkpoints } => format!(
                 "the workload has room for only {checkpoints} checkpoints (it takes {ENOUGH}) and all were answered"
             ),
-            Why::Retried => "answers were missing for 3 s; they all came when ttystorm waited longer or repeated the run, so the terminal answers slowly or unevenly".to_string(),
+            Why::OutOfOrder { before_report, checkpoints } => format!(
+                "all {checkpoints} checkpoints were answered, but only {before_report} before the cursor report that ended the run: the terminal answers from another thread or out of order, and the time may end before it has parsed everything"
+            ),
+            Why::Retried { answered, checkpoints } => format!(
+                "{answered} of {checkpoints} checkpoints were answered after 3 s; the run was repeated and all were, so the terminal answers slowly or unevenly"
+            ),
             Why::Unknown => {
                 "the result file says something this version of ttystorm does not know".to_string()
             }
@@ -165,33 +195,29 @@ impl Why {
 /// The line under the result screen's header: what the checks found over all the tests, `None`
 /// when no test had one (all saved by an older ttystorm, or only `roundtrip`).
 pub fn summary(checks: &[(&str, &Check)]) -> Option<(Level, String)> {
-    let dropped: Vec<&str> = checks.iter().filter(|(_, c)| c.is_dropped()).map(|(n, _)| *n).collect();
-    if !dropped.is_empty() {
-        return Some((
-            Level::Bad,
-            format!(
-                "Dropped input in {}: the terminal did not parse everything it was sent, so no number is given.",
-                dropped.join(", ")
-            ),
-        ));
-    }
-    let unverified: Vec<(&str, &Why)> = checks
+    let dropped: Vec<String> = checks
         .iter()
         .filter_map(|(n, c)| match c {
-            Check::Unchecked(why) => Some((*n, why)),
+            Check::Dropped { answered, checkpoints } => {
+                Some(format!("{n} ({answered} of {checkpoints} answered)"))
+            }
             _ => None,
         })
         .collect();
-    if let Some((_, why)) = unverified.first() {
-        let names: Vec<&str> = unverified.iter().map(|(n, _)| *n).collect();
-        let all = if names.len() == checks.len() { "all tests" } else { &names.join(", ") };
-        return Some((
-            Level::Warn,
-            format!(
-                "Not verified ({all}): {}. Unverified numbers rank only among themselves in `compare`.",
-                why.sentence()
-            ),
-        ));
+    let unverified = unverified_text(checks);
+    if !dropped.is_empty() {
+        let mut text = format!(
+            "Dropped input in {}: checkpoints went unanswered in a patient repeat of the run too, so the terminal lost input or withheld answers, and no number is given.",
+            dropped.join(", ")
+        );
+        if let Some(rest) = unverified {
+            text.push(' ');
+            text.push_str(&rest);
+        }
+        return Some((Level::Bad, text));
+    }
+    if let Some(text) = unverified {
+        return Some((Level::Warn, text));
     }
     let total: u64 = checks
         .iter()
@@ -208,6 +234,31 @@ pub fn summary(checks: &[(&str, &Check)]) -> Option<(Level, String)> {
     })
 }
 
+/// The tests that are not verified, a sentence for each reason with the tests it applies to; `None`
+/// when there are none.
+fn unverified_text(checks: &[(&str, &Check)]) -> Option<String> {
+    let mut groups: Vec<(String, Vec<&str>)> = Vec::new();
+    for (name, check) in checks {
+        let Check::Unchecked(why) = check else { continue };
+        let reason = why.sentence();
+        match groups.iter_mut().find(|(r, _)| *r == reason) {
+            Some((_, names)) => names.push(name),
+            None => groups.push((reason, vec![name])),
+        }
+    }
+    if groups.is_empty() {
+        return None;
+    }
+    let parts: Vec<String> = groups
+        .iter()
+        .map(|(reason, names)| {
+            let which = if names.len() == checks.len() { "all tests".to_string() } else { names.join(", ") };
+            format!("Not verified ({which}): {reason}.")
+        })
+        .collect();
+    Some(format!("{} Unverified numbers rank only among themselves in `compare`.", parts.join(" ")))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Level {
     Good,
@@ -221,13 +272,32 @@ mod tests {
 
     #[test]
     fn answers_are_judged_against_the_questions() {
-        assert_eq!(Check::judge(16, 16), Check::Verified { checkpoints: 16 });
-        assert_eq!(Check::judge(16, 3), Check::Dropped { answered: 3, checkpoints: 16 });
-        assert_eq!(Check::judge(16, 17), Check::Unchecked(Why::Surplus { answered: 17, checkpoints: 16 }));
-        assert_eq!(Check::judge(0, 0), Check::Unchecked(Why::TooFew { checkpoints: 0 }));
+        assert_eq!(Check::judge(16, 16, 16), Check::Verified { checkpoints: 16 });
+        assert_eq!(Check::judge(16, 3, 3), Check::Dropped { answered: 3, checkpoints: 16 });
+        assert_eq!(
+            Check::judge(16, 17, 17),
+            Check::Unchecked(Why::Surplus { answered: 17, checkpoints: 16 })
+        );
+        assert_eq!(Check::judge(0, 0, 0), Check::Unchecked(Why::TooFew { checkpoints: 0 }));
         // Few, all answered: not verified. Few, one missing: still dropped.
-        assert_eq!(Check::judge(15, 15), Check::Unchecked(Why::TooFew { checkpoints: 15 }));
-        assert_eq!(Check::judge(15, 14), Check::Dropped { answered: 14, checkpoints: 15 });
+        assert_eq!(Check::judge(15, 15, 15), Check::Unchecked(Why::TooFew { checkpoints: 15 }));
+        assert_eq!(Check::judge(15, 14, 14), Check::Dropped { answered: 14, checkpoints: 15 });
+    }
+
+    #[test]
+    fn answers_that_were_not_all_in_before_the_cursor_report_are_never_verified() {
+        // All there, one behind the cursor report: unverified, and not dropped.
+        assert_eq!(
+            Check::judge(16, 16, 15),
+            Check::Unchecked(Why::OutOfOrder { before_report: 15, checkpoints: 16 })
+        );
+        assert_eq!(
+            Check::judge(48, 48, 0),
+            Check::Unchecked(Why::OutOfOrder { before_report: 0, checkpoints: 48 })
+        );
+        // Missing ones are still dropped, whatever the order; too many is still no witness.
+        assert_eq!(Check::judge(16, 10, 2), Check::Dropped { answered: 10, checkpoints: 16 });
+        assert!(matches!(Check::judge(16, 20, 3), Check::Unchecked(Why::Surplus { .. })));
     }
 
     #[test]
@@ -251,7 +321,8 @@ mod tests {
             Check::Unchecked(Why::Lossy { answered: 5 }),
             Check::Unchecked(Why::Surplus { answered: 50, checkpoints: 48 }),
             Check::Unchecked(Why::TooFew { checkpoints: 9 }),
-            Check::Unchecked(Why::Retried),
+            Check::Unchecked(Why::OutOfOrder { before_report: 40, checkpoints: 48 }),
+            Check::Unchecked(Why::Retried { answered: 31, checkpoints: 48 }),
             Check::Unchecked(Why::Unknown),
         ] {
             let v = json::parse(&c.to_json()).expect("json");
@@ -266,7 +337,7 @@ mod tests {
         let unk = Check::Unchecked(Why::Silent);
         let (level, text) = summary(&[("a", &ok), ("b", &drop), ("c", &unk)]).expect("summary");
         assert_eq!(level, Level::Bad);
-        assert!(text.contains(" b:"), "{text}");
+        assert!(text.contains(" b (1 of 16 answered):"), "{text}");
         assert_eq!(summary(&[("a", &ok), ("c", &unk)]).map(|s| s.0), Some(Level::Warn));
         let (level, text) = summary(&[("a", &ok), ("b", &ok)]).expect("summary");
         assert_eq!(level, Level::Good);
@@ -285,6 +356,15 @@ mod tests {
         assert_eq!(read("{}"), Some(Check::Unchecked(Why::Unknown)));
         // Nothing there is a file from before the check.
         assert_eq!(read("null"), None);
+        // A "verified" that doesn't say what it counted, or counted too little, is not taken at its word.
+        let unknown = Some(Check::Unchecked(Why::Unknown));
+        assert_eq!(read("{\"status\": \"verified\"}"), unknown);
+        assert_eq!(read("{\"status\": \"verified\", \"checkpoints\": 15, \"answered\": 15}"), unknown);
+        assert_eq!(read("{\"status\": \"verified\", \"checkpoints\": 48, \"answered\": 40}"), unknown);
+        assert_eq!(
+            read("{\"status\": \"verified\", \"checkpoints\": 16, \"answered\": 16}"),
+            Some(Check::Verified { checkpoints: 16 })
+        );
     }
 
     #[test]
@@ -295,5 +375,38 @@ mod tests {
         assert!(text.starts_with("Not verified (glyphstorm)"), "{text}");
         let (_, text) = summary(&[("glyphstorm", &few)]).expect("summary");
         assert!(text.starts_with("Not verified (all tests)"), "{text}");
+    }
+
+    #[test]
+    fn each_reason_is_given_with_its_own_tests() {
+        let ok = Check::Verified { checkpoints: 16 };
+        let few = Check::Unchecked(Why::TooFew { checkpoints: 9 });
+        let late = Check::Unchecked(Why::OutOfOrder { before_report: 3, checkpoints: 40 });
+        let (level, text) =
+            summary(&[("logflood", &ok), ("glyphstorm", &few), ("buildlog", &late), ("editstorm", &few)])
+                .expect("summary");
+        assert_eq!(level, Level::Warn);
+        assert!(
+            text.contains("Not verified (glyphstorm, editstorm): the workload has room for only 9"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Not verified (buildlog): all 40 checkpoints were answered, but only 3"),
+            "{text}"
+        );
+        assert_eq!(text.matches("rank only among themselves").count(), 1, "{text}");
+    }
+
+    #[test]
+    fn a_dropped_test_does_not_hide_the_unverified_ones() {
+        let drop = Check::Dropped { answered: 20, checkpoints: 60 };
+        let off = Check::Unchecked(Why::Silent);
+        let (level, text) = summary(&[("logflood", &drop), ("buildlog", &off)]).expect("summary");
+        assert_eq!(level, Level::Bad);
+        assert!(text.starts_with("Dropped input in logflood (20 of 60 answered):"), "{text}");
+        assert!(
+            text.contains("lost input or withheld answers") && text.contains("Not verified (buildlog)"),
+            "{text}"
+        );
     }
 }
